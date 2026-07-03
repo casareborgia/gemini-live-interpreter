@@ -47,6 +47,9 @@ function App() {
   const [langA, setLangA] = useState<string>('ko'); // 대면 양방향: 내 언어
   const [langB, setLangB] = useState<string>('en'); // 대면 양방향: 상대 언어
   const [inputSource, setInputSource] = useState<InputSource>('mic');
+  const [voiceName, setVoiceName] = useState<string>(() => {
+    return localStorage.getItem('GEMINI_LIVE_VOICE_NAME') || 'Kore'; // 기본값 여성 Kore
+  });
   const [echoTarget, setEchoTarget] = useState<boolean>(true);
   const [outputVolume, setOutputVolume] = useState<number>(1); // 번역 음성 볼륨 (0 ~ 1)
   const [subtitleOnly, setSubtitleOnly] = useState<boolean>(false); // 자막 전용(더빙 음성 끄기)
@@ -65,6 +68,11 @@ function App() {
   useEffect(() => {
     localStorage.setItem('GEMINI_LIVE_API_KEY', apiKey);
   }, [apiKey]);
+
+  // 로컬 스토리지에 보이스 이름 저장
+  useEffect(() => {
+    localStorage.setItem('GEMINI_LIVE_VOICE_NAME', voiceName);
+  }, [voiceName]);
 
   // 대화 기록 추가 시 자동 스크롤
   useEffect(() => {
@@ -158,18 +166,18 @@ function App() {
         // 대면 양방향: 서로 반대 타깃 2세션, echo=false → 이미 타깃 언어인 입력은 침묵 처리되어 중복 방지
         // 세션A(target=langB): langA 화자의 말을 langB로 번역 → 상대(B)쪽 자막
         const sessionA = new TranslationSession(
-          { apiKey, targetLang: langB, echoTargetLanguage: false, autoReconnect: true, volume: effectiveVolume, emitInputTranscript: false },
+          { apiKey, targetLang: langB, echoTargetLanguage: false, autoReconnect: true, volume: effectiveVolume, emitInputTranscript: false, voiceName },
           { onStatus: handleSessionStatus, onTranscript: (t) => upsertTranscript(t, 'B') }
         );
         // 세션B(target=langA): langB 화자의 말을 langA로 번역 → 내(A)쪽 자막
         const sessionB = new TranslationSession(
-          { apiKey, targetLang: langA, echoTargetLanguage: false, autoReconnect: true, volume: effectiveVolume, emitInputTranscript: false },
+          { apiKey, targetLang: langA, echoTargetLanguage: false, autoReconnect: true, volume: effectiveVolume, emitInputTranscript: false, voiceName },
           { onStatus: handleSessionStatus, onTranscript: (t) => upsertTranscript(t, 'A') }
         );
         sessionsRef.current = [sessionA, sessionB];
       } else {
         const session = new TranslationSession(
-          { apiKey, targetLang, echoTargetLanguage: echoTarget, autoReconnect: true, volume: effectiveVolume, emitInputTranscript: true },
+          { apiKey, targetLang, echoTargetLanguage: echoTarget, autoReconnect: true, volume: effectiveVolume, emitInputTranscript: true, voiceName },
           { onStatus: handleSessionStatus, onTranscript: (t) => upsertTranscript(t) }
         );
         sessionsRef.current = [session];
@@ -305,6 +313,19 @@ function App() {
               >
                 <option value="mic">🎙️ 내 마이크 (직접 말하기)</option>
                 <option value="system">🔊 영상/탭 소리 (외국어 영상 더빙)</option>
+              </select>
+            </div>
+
+            <div style={styles.fieldRow}>
+              <label style={styles.label}>번역 음성 목소리 (성별)</label>
+              <select
+                value={voiceName}
+                onChange={(e) => setVoiceName(e.target.value)}
+                style={styles.select}
+                disabled={isTranslating}
+              >
+                <option value="Kore">👩 여성 음성 (Kore)</option>
+                <option value="Puck">👨 남성 음성 (Puck)</option>
               </select>
             </div>
 

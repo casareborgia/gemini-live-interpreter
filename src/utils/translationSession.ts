@@ -28,6 +28,8 @@ export interface TranslationSessionOptions {
   volume?: number;
   /** 입력(원문) 자막도 보고할지. 양방향에서는 중복이라 false로 끈다 */
   emitInputTranscript?: boolean;
+  /** 번역 음성 출력 목소리 이름 (예: Puck, Kore 등) */
+  voiceName?: string;
 }
 
 const MODEL_NAME = 'gemini-3.5-live-translate-preview';
@@ -93,11 +95,20 @@ export class TranslationSession {
   }
 
   private buildSetupMessage() {
+    const voiceConfig = this.opts.voiceName ? {
+      voiceConfig: {
+        prebuiltVoiceConfig: {
+          voiceName: this.opts.voiceName,
+        },
+      },
+    } : undefined;
+
     return {
       setup: {
         model: `models/${MODEL_NAME}`,
         generationConfig: {
           responseModalities: ['AUDIO'],
+          ...(voiceConfig ? { speechConfig: voiceConfig } : {}),
           translationConfig: {
             targetLanguageCode: this.opts.targetLang,
             echoTargetLanguage: this.opts.echoTargetLanguage,
