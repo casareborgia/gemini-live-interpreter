@@ -25,3 +25,8 @@ __pycache__/
 *.njsproj
 *.sln
 *.sw?
+
+# Python virtual environments
+.venv/
+venv/
+__pycache__/
