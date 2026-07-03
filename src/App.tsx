@@ -60,6 +60,7 @@ function App() {
   const recorderRef = useRef<AudioRecorder | null>(null);
   const sessionsRef = useRef<TranslationSession[]>([]);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const backendWsRef = useRef<WebSocket | null>(null);
 
   // 실제 적용되는 출력 볼륨 (자막 전용이면 0)
   const effectiveVolume = subtitleOnly ? 0 : outputVolume;
@@ -142,11 +143,44 @@ function App() {
     try {
       setIsTranslating(true);
 
-      // 1. 마이크/시스템 오디오 레코더 준비 — 받은 청크를 모든 세션에 전달
+      // 로컬 화자 분할 백엔드 연결
+      const backendWs = new WebSocket('ws://localhost:8000/ws/audio');
+      backendWsRef.current = backendWs;
+      
+      backendWs.onopen = () => {
+        console.log('Connected to local diarization backend');
+      };
+      
+      backendWs.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'diarization') {
+            console.log('Diarization Speaker Detected:', msg.speaker);
+            if (msg.speaker === 'SILENCE') {
+              setStatusMessage('✨ 대화 대기 중... (음소거 상태)');
+            } else {
+              setStatusMessage(`🗣️ 화자 감지됨: ${msg.speaker} (실시간 통역 진행 중)`);
+            }
+          }
+        } catch (err) {
+          console.error('Diarization message parsing error:', err);
+        }
+      };
+
+      backendWs.onclose = () => {
+        console.log('Disconnected from local diarization backend');
+      };
+
+      // 1. 마이크/시스템 오디오 레코더 준비 — 받은 청크를 Gemini 세션 및 로컬 백엔드에 모두 전달
       recorderRef.current = new AudioRecorder((chunk: ArrayBuffer) => {
+        // Gemini Live API로 전송 (Base64)
         const base64Data = arrayBufferToBase64(chunk);
         for (const session of sessionsRef.current) {
           session.sendAudioBase64(base64Data);
+        }
+        // 로컬 화자 분할 백엔드로 전송 (바이너리)
+        if (backendWsRef.current && backendWsRef.current.readyState === WebSocket.OPEN) {
+          backendWsRef.current.send(chunk);
         }
       });
 
@@ -201,6 +235,11 @@ function App() {
     if (recorderRef.current) {
       recorderRef.current.stop();
       recorderRef.current = null;
+    }
+
+    if (backendWsRef.current) {
+      backendWsRef.current.close();
+      backendWsRef.current = null;
     }
 
     for (const session of sessionsRef.current) {
