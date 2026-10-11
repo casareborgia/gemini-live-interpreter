@@ -30,3 +30,12 @@ __pycache__/
 .venv/
 venv/
 __pycache__/
+*.pyc
+*.egg-info/
+
+# Local tool configs that may contain credentials
+.codex/
+.mcp.json
+
+# Firebase deploy cache
+.firebase/
