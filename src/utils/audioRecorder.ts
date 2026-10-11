@@ -28,13 +28,23 @@ export class AudioRecorder {
     if (source === 'system') {
       // 탭/화면 소리 캡처: 사용자가 공유할 화면/창/탭을 고르고 '오디오 공유'를 체크해야 함
       try {
+        // restrictOwnAudio: 이 탭이 재생하는 소리(번역 음성)를 시스템 오디오 캡처에서 제외 (지원 브라우저에서만)
+        const supported = navigator.mediaDevices.getSupportedConstraints() as MediaTrackSupportedConstraints & {
+          restrictOwnAudio?: boolean;
+        };
+        const audioConstraints: MediaTrackConstraints & { restrictOwnAudio?: boolean } = {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        };
+        if (supported.restrictOwnAudio) {
+          audioConstraints.restrictOwnAudio = true;
+        } else {
+          console.warn('이 브라우저는 restrictOwnAudio 를 지원하지 않아, 이 탭의 번역 음성이 시스템 오디오 캡처에 포함될 수 있습니다.');
+        }
         this.stream = await navigator.mediaDevices.getDisplayMedia({
           video: true, // 브라우저 규격상 video:true가 있어야 선택 UI가 뜸 (영상 트랙은 사용하지 않음)
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-          },
+          audio: audioConstraints,
         });
       } catch (err: unknown) {
         console.error('getDisplayMedia 실패:', err);

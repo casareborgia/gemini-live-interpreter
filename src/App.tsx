@@ -98,6 +98,12 @@ function App() {
   const [callInboundAudio, setCallInboundAudio] = useState<boolean>(() => {
     return localStorage.getItem('GEMINI_LIVE_CALL_INBOUND_AUDIO') !== 'false';
   });
+  // 송신 번역 음성을 내 스피커로도 재생할지 (기본 꺼짐: 스피커로 나가면 화면 캡처/마이크로 되돌아와 하울링이 됨)
+  const [callOutboundMonitor, setCallOutboundMonitor] = useState<boolean>(() => {
+    return localStorage.getItem('GEMINI_LIVE_CALL_OUTBOUND_MONITOR') === 'true';
+  });
+  // 송신 번역 음성이 실제로 재생되는 조건: 전용 출력 장치(BlackHole 등)를 골랐거나 모니터링을 켰을 때
+  const outboundAudible = Boolean(callOutboundSinkId) || callOutboundMonitor;
 
   // 영상통화 모드 전용 자막 및 상태
   const [inboundTranscripts, setInboundTranscripts] = useState<CallTranscriptMessage[]>([]);
@@ -158,6 +164,10 @@ function App() {
     localStorage.setItem('GEMINI_LIVE_CALL_INBOUND_AUDIO', String(callInboundAudio));
   }, [callInboundAudio]);
 
+  useEffect(() => {
+    localStorage.setItem('GEMINI_LIVE_CALL_OUTBOUND_MONITOR', String(callOutboundMonitor));
+  }, [callOutboundMonitor]);
+
   // 대화 기록 추가 시 자동 스크롤
   useEffect(() => {
     timelineEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -167,13 +177,13 @@ function App() {
   useEffect(() => {
     if (mode === 'call') {
       inboundSessionRef.current?.setVolume(callInboundAudio ? effectiveVolume : 0);
-      outboundSessionRef.current?.setVolume(effectiveVolume);
+      outboundSessionRef.current?.setVolume(outboundAudible ? effectiveVolume : 0);
     } else {
       for (const session of sessionsRef.current) {
         session.setVolume(effectiveVolume);
       }
     }
-  }, [effectiveVolume, callInboundAudio, mode]);
+  }, [effectiveVolume, callInboundAudio, outboundAudible, mode]);
 
   // 통화 모드 출력 장치 변경 시 즉시 반영
   useEffect(() => {
@@ -382,7 +392,7 @@ function App() {
             echoTargetLanguage: false,
             emitInputTranscript: true,
             autoReconnect: true,
-            volume: effectiveVolume,
+            volume: outboundAudible ? effectiveVolume : 0,
             voiceName: voiceNameA, // 내 목소리용
             sinkId: callOutboundSinkId || undefined,
           },
@@ -743,6 +753,8 @@ function App() {
             onOutboundSinkIdChange={setCallOutboundSinkId}
             inboundAudio={callInboundAudio}
             onInboundAudioChange={setCallInboundAudio}
+            outboundMonitor={callOutboundMonitor}
+            onOutboundMonitorChange={setCallOutboundMonitor}
             supportedLanguages={SUPPORTED_LANGUAGES}
             disabled={isTranslating}
           />

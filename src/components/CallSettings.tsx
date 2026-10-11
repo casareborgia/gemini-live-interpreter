@@ -14,6 +14,8 @@ export interface CallSettingsProps {
   onOutboundSinkIdChange: (id: string) => void;
   inboundAudio: boolean;
   onInboundAudioChange: (enabled: boolean) => void;
+  outboundMonitor: boolean;
+  onOutboundMonitorChange: (enabled: boolean) => void;
   supportedLanguages: { code: string; name: string }[];
   disabled?: boolean;
 }
@@ -31,6 +33,8 @@ export const CallSettings: React.FC<CallSettingsProps> = ({
   onOutboundSinkIdChange,
   inboundAudio,
   onInboundAudioChange,
+  outboundMonitor,
+  onOutboundMonitorChange,
   supportedLanguages,
   disabled = false,
 }) => {
@@ -94,9 +98,10 @@ export const CallSettings: React.FC<CallSettingsProps> = ({
       <div style={styles.alertWarning}>
         <span style={styles.alertIcon}>⚠️</span>
         <div>
-          <strong>하울링(루프) 방지 주의사항:</strong> 전체 화면 공유 시 수신 번역 음성이 다시 캡처되어
-          상대방에게 되돌아갈 수 있습니다. 텔레그램 <strong>창</strong> 또는 <strong>탭</strong>만 선택해
-          공유하거나, <strong>수신 번역 음성을 끄고 자막만</strong> 사용하세요.
+          <strong>하울링(루프) 방지 주의사항:</strong> 수신 번역 음성은 반드시 <strong>헤드폰</strong>으로
+          들으세요. 스피커로 들으면 마이크가 다시 받아 송신 세션이 번역을 반복합니다. 송신 번역 음성은
+          <strong>BlackHole 등 전용 출력 장치</strong>로 보내고, 그 전까지는 아래 "내 스피커로도 재생"을 끈 채
+          자막으로만 확인하세요. 하울링이 계속되면 <strong>수신 번역 음성을 끄고 자막만</strong> 사용하세요.
         </div>
       </div>
 
@@ -193,7 +198,7 @@ export const CallSettings: React.FC<CallSettingsProps> = ({
                 onChange={(e) => onOutboundSinkIdChange(e.target.value)}
                 style={styles.select}
               >
-                <option value="">기본 출력 (동작 확인용 로컬 재생)</option>
+                <option value="">선택 안 함 (송신 음성 재생하지 않음 — 자막만)</option>
                 {devices.outputs.map((d, idx) => (
                   <option key={d.deviceId || idx} value={d.deviceId}>
                     {d.label || `출력 장치 ${idx + 1}`}
@@ -202,7 +207,8 @@ export const CallSettings: React.FC<CallSettingsProps> = ({
               </select>
             </label>
             <span style={styles.helperText}>
-              💡 텔레그램 마이크로 내 번역 음성을 보내려면 BlackHole 2ch을 선택하세요.
+              💡 텔레그램 마이크로 내 번역 음성을 보내려면 BlackHole 2ch을 선택하세요. 선택하지 않으면 송신
+              번역 음성은 재생되지 않고 자막으로만 표시됩니다 (스피커 재생은 하울링의 원인).
             </span>
           </div>
         </div>
@@ -221,6 +227,25 @@ export const CallSettings: React.FC<CallSettingsProps> = ({
             type="checkbox"
             checked={inboundAudio}
             onChange={(e) => onInboundAudioChange(e.target.checked)}
+          />
+          <span style={styles.slider} />
+        </label>
+      </div>
+
+      {/* 송신 번역 음성 로컬 모니터링 토글 (기본 꺼짐) */}
+      <div style={styles.toggleRow}>
+        <div>
+          <div style={styles.toggleTitle}>송신 번역 음성을 내 스피커로도 재생 (테스트용)</div>
+          <div style={styles.toggleDesc}>
+            기본 꺼짐. 켜면 스피커로 나간 번역 음성이 화면 캡처와 마이크로 되돌아와 하울링이 생길 수 있습니다.
+            전용 출력 장치를 선택한 경우에는 이 설정과 무관하게 그 장치로만 출력됩니다.
+          </div>
+        </div>
+        <label style={styles.switch}>
+          <input
+            type="checkbox"
+            checked={outboundMonitor}
+            onChange={(e) => onOutboundMonitorChange(e.target.checked)}
           />
           <span style={styles.slider} />
         </label>
