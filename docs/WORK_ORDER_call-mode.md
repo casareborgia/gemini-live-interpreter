@@ -3,8 +3,8 @@
 - 대상 프로젝트: Gemini Live Interpreter (이 저장소)
 - 작업자: Antigravity
 - 검증자: Claude Code (완료 기준 섹션 기준으로 검증)
-- 작업 브랜치: `feat/call-mode` (main에서 분기, main 직접 커밋 금지)
-- 작성일: 2026-10-11
+- 작업 브랜치: `feat/call-mode` (`feat/speaker-diarization-v2` 가 main 에 머지된 뒤 main 에서 분기, main 직접 커밋 금지)
+- 작성일: 2026-10-11 (개정: 2026-10-11, 백엔드 프록시 구조 반영)
 
 ---
 
@@ -26,10 +26,12 @@
 ## 2. 전제 조건 (변경하지 말 것)
 
 - 개인 사용 목적이다. 배포용 구조(백엔드 중계, 키 서버 보관 등)는 이번 범위에 넣지 않는다.
-- 실행 환경: macOS 26, Chrome 141 이상, `npm run dev` 로 실행하는 Vite 개발 서버. Vite 프록시(`/ws-api`) 구조는 유지한다.
+- 실행 환경: macOS 26, Chrome 141 이상, `npm run dev` 로 실행하는 Vite 개발 서버 + `uvicorn main:app --port 8000` 으로 실행하는 로컬 백엔드.
+  - **Gemini Live 연결은 백엔드 프록시를 거친다.** `translationSession.ts` 가 개발 환경에서 `ws://localhost:8000/ws-api/...` 로 접속하고 첫 프레임으로 API 키를 보낸다. 이 구조는 유지한다.
+  - `vite.config.ts` 의 `/ws-api` 프록시는 더 이상 사용되지 않는 죽은 설정이다. 제거해도 되고 두어도 되지만, 통화 모드가 이 프록시에 의존하게 만들면 안 된다.
 - 기존 `single`(영상·마이크 단방향), `dual`(대면 양방향) 모드는 **동작이 바뀌면 안 된다.**
 - Gemini 모델명, setup 메시지 구조(`translationConfig`, VAD 설정 등)는 건드리지 않는다.
-- `backend/` 는 이번 작업에서 수정하지 않는다. 단, 통화 모드에서는 백엔드(`ws://localhost:8000/ws/audio`)에 연결하지 않는다 (아래 4.5 참조).
+- `backend/` 는 이번 작업에서 수정하지 않는다. 통화 모드는 백엔드의 **Gemini 프록시(`/ws-api/...`)는 사용**하되, **화자 분할 WebSocket(`/ws/audio`)에는 연결하지 않는다** (아래 4.5 참조).
 - `.env`, API 키, HF 토큰 등 민감 정보는 절대 커밋하지 않는다.
 
 ## 3. 작업 범위
@@ -125,10 +127,10 @@
 1. 유효성 검사: `callMyLang !== callRemoteLang`
 2. 수신 레코더 `start({ source: 'system' })` → 사용자가 텔레그램 창/탭/전체 화면 선택. 오디오 트랙 없으면 중단하고 안내.
 3. 송신 레코더 `start({ source: 'mic', deviceId: callMicDeviceId })`
-4. 수신 세션: `{ targetLang: callMyLang, echoTargetLanguage: false, emitInputTranscript: true, autoReconnect: true, volume: callInboundAudio ? outputVolume : 0, voiceName }`
-5. 송신 세션: `{ targetLang: callRemoteLang, echoTargetLanguage: false, emitInputTranscript: true, autoReconnect: true, volume: outputVolume, voiceName }`
+4. 수신 세션: `{ targetLang: callMyLang, echoTargetLanguage: false, emitInputTranscript: true, autoReconnect: true, volume: callInboundAudio ? outputVolume : 0, voiceName: voiceNameB }` (상대 목소리용 B 보이스)
+5. 송신 세션: `{ targetLang: callRemoteLang, echoTargetLanguage: false, emitInputTranscript: true, autoReconnect: true, volume: outputVolume, voiceName: voiceNameA }` (내 목소리용 A 보이스)
    - Phase 1에서는 출력 장치 미지정(기본 출력). Phase 2에서 `sinkId: callOutboundSinkId`.
-6. 통화 모드에서는 **백엔드 WebSocket(`localhost:8000`)에 연결하지 않는다.** (채널 자체가 화자를 구분하므로 불필요. 연결 실패 로그가 콘솔을 오염시키는 것도 방지)
+6. 통화 모드에서는 **화자 분할 WebSocket(`/ws/audio`)에 연결하지 않는다.** 채널(마이크 vs 시스템 오디오) 자체가 화자를 구분하므로 불필요하다. 같은 이유로 통화 세션에는 `getCurrentSpeaker` 를 넘기지 않아 화자별 피치 변조도 적용되지 않게 한다. Gemini 프록시(`/ws-api/...`) 연결은 기존대로 사용한다.
 
 **통화 모드 자막 UI**
 - 좌우 또는 상하 2분할. 180° 회전은 하지 않는다.
@@ -171,6 +173,8 @@
 - [ ] `git status` 깨끗, `.env`·키 파일 미포함, 커밋은 의미 단위로 분리 (예: 리팩터링 / call 모드 UI / 장치 선택 / README)
 
 ### 회귀 (기존 모드)
+모든 수동 테스트는 로컬 백엔드(`uvicorn`)를 띄운 상태에서 진행한다. 백엔드 없이는 Gemini 연결 자체가 되지 않는다.
+
 - [ ] `single` + 마이크: 자막·음성 정상
 - [ ] `single` + 탭 오디오(유튜브): 자막·음성 정상, 자막 전용 토글 정상
 - [ ] `dual`: A/B 분리 자막, 180° 회전 유지
@@ -184,7 +188,7 @@
 - [ ] 텔레그램 데스크톱 통화 중 "전체 화면 + 시스템 오디오" 공유로 상대 음성이 통역된다
 - [ ] 수신 번역 음성 끄기 토글이 즉시 반영된다
 - [ ] 수신 세션만 강제로 끊어도(예: 네트워크 차단) 송신 세션은 유지되고 상태 표시가 세션별로 갱신된다
-- [ ] 통화 모드에서 `localhost:8000` 연결 시도가 콘솔에 보이지 않는다
+- [ ] 통화 모드에서 `/ws/audio` 연결 시도가 네트워크 탭에 없고, `/ws-api/...` 프록시 연결은 세션 수(2개)만큼 있다
 - [ ] 하울링 루프 발생 여부가 보고서에 기록되어 있다
 
 ### Phase 2 기능
