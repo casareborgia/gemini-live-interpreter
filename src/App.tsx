@@ -9,6 +9,8 @@ interface TranscriptItem {
   langCode?: string;
   timestamp: Date;
   side?: 'A' | 'B'; // 대면 양방향 모드에서 어느 화자 쪽 자막인지
+  speaker?: string;  // 화자 식별 정보 (SPEAKER_00, SPEAKER_01 등)
+  frozen?: boolean;  // 화자 전환으로 인해 해당 턴이 닫혔는지 여부
 }
 
 // 통역 모드: single = 영상 더빙/마이크 단방향, dual = 대면 양방향
@@ -47,8 +49,11 @@ function App() {
   const [langA, setLangA] = useState<string>('ko'); // 대면 양방향: 내 언어
   const [langB, setLangB] = useState<string>('en'); // 대면 양방향: 상대 언어
   const [inputSource, setInputSource] = useState<InputSource>('mic');
-  const [voiceName, setVoiceName] = useState<string>(() => {
-    return localStorage.getItem('GEMINI_LIVE_VOICE_NAME') || 'Kore'; // 기본값 여성 Kore
+  const [voiceNameA, setVoiceNameA] = useState<string>(() => {
+    return localStorage.getItem('GEMINI_LIVE_VOICE_NAME_A') || localStorage.getItem('GEMINI_LIVE_VOICE_NAME') || 'Kore';
+  });
+  const [voiceNameB, setVoiceNameB] = useState<string>(() => {
+    return localStorage.getItem('GEMINI_LIVE_VOICE_NAME_B') || 'Puck'; // 기본값 남성 Puck
   });
   const [echoTarget, setEchoTarget] = useState<boolean>(true);
   const [outputVolume, setOutputVolume] = useState<number>(1); // 번역 음성 볼륨 (0 ~ 1)
@@ -56,11 +61,15 @@ function App() {
   const [isTranslating, setIsTranslating] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>('API 키를 입력하고 통역을 시작하세요.');
   const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
+  const [maxSpeakers, setMaxSpeakers] = useState<number>(() => {
+    return Number(localStorage.getItem('GEMINI_LIVE_MAX_SPEAKERS')) || 0; // 기본값 0 (자동)
+  });
 
   const recorderRef = useRef<AudioRecorder | null>(null);
   const sessionsRef = useRef<TranslationSession[]>([]);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const backendWsRef = useRef<WebSocket | null>(null);
+  const currentSpeakerRef = useRef<string>('SPEAKER_00');
 
   // 실제 적용되는 출력 볼륨 (자막 전용이면 0)
   const effectiveVolume = subtitleOnly ? 0 : outputVolume;
@@ -72,8 +81,16 @@ function App() {
 
   // 로컬 스토리지에 보이스 이름 저장
   useEffect(() => {
-    localStorage.setItem('GEMINI_LIVE_VOICE_NAME', voiceName);
-  }, [voiceName]);
+    localStorage.setItem('GEMINI_LIVE_VOICE_NAME_A', voiceNameA);
+  }, [voiceNameA]);
+
+  useEffect(() => {
+    localStorage.setItem('GEMINI_LIVE_VOICE_NAME_B', voiceNameB);
+  }, [voiceNameB]);
+
+  useEffect(() => {
+    localStorage.setItem('GEMINI_LIVE_MAX_SPEAKERS', String(maxSpeakers));
+  }, [maxSpeakers]);
 
   // 대화 기록 추가 시 자동 스크롤
   useEffect(() => {
@@ -97,6 +114,11 @@ function App() {
   // 세션이 보내온 자막(이미 누적된 전체 텍스트)을 id 기준으로 추가/갱신
   const upsertTranscript = (t: SessionTranscript, side?: 'A' | 'B') => {
     setTranscripts((prev) => {
+      // 기존에 이미 등록된 아이템이 있는지 먼저 확인 (화자 ID 유지를 위함)
+      const idx = prev.findIndex((it) => it.id === t.id);
+      const existingSpeaker = idx >= 0 ? prev[idx].speaker : undefined;
+      const existingFrozen = idx >= 0 ? prev[idx].frozen : false;
+
       const item: TranscriptItem = {
         id: t.id,
         type: t.role,
@@ -104,8 +126,10 @@ function App() {
         langCode: t.langCode,
         timestamp: new Date(),
         side,
+        // 입력 자막에만 화자 ID 부여 (기존에 부여된 화자 ID가 있다면 재사용, 없으면 현재 실시간 감지 화자 부여)
+        speaker: t.role === 'input' ? (existingSpeaker || currentSpeakerRef.current) : undefined,
+        frozen: existingFrozen,
       };
-      const idx = prev.findIndex((it) => it.id === t.id);
       if (idx >= 0) {
         const updated = [...prev];
         updated[idx] = { ...prev[idx], ...item };
@@ -143,33 +167,81 @@ function App() {
     try {
       setIsTranslating(true);
 
-      // 로컬 화자 분할 백엔드 연결
-      const backendWs = new WebSocket('ws://localhost:8000/ws/audio');
-      backendWsRef.current = backendWs;
-      
-      backendWs.onopen = () => {
-        console.log('Connected to local diarization backend');
-      };
-      
-      backendWs.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data);
-          if (msg.type === 'diarization') {
-            console.log('Diarization Speaker Detected:', msg.speaker);
-            if (msg.speaker === 'SILENCE') {
-              setStatusMessage('✨ 대화 대기 중... (음소거 상태)');
-            } else {
-              setStatusMessage(`🗣️ 화자 감지됨: ${msg.speaker} (실시간 통역 진행 중)`);
+      // 단방향(영상 더빙) 모드일 때만 화자 분할 백엔드 연결
+      if (mode !== 'dual') {
+        const isProduction = import.meta.env.PROD;
+        const backendUrl = isProduction
+          ? (import.meta.env.VITE_BACKEND_URL || 'wss://translation-backend-517419857386.asia-northeast3.run.app')
+          : 'ws://localhost:8000';
+        const backendWs = new WebSocket(`${backendUrl}/ws/audio?max_speakers=${maxSpeakers}`);
+        backendWsRef.current = backendWs;
+        
+        backendWs.onopen = () => {
+          console.log('Connected to local diarization backend');
+        };
+        
+        backendWs.onmessage = (e) => {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'speaker_merged') {
+              console.log(`Speaker Merged: ${msg.from} -> ${msg.into}`);
+              setTranscripts((prev) => 
+                prev.map((it) => it.speaker === msg.from ? { ...it, speaker: msg.into } : it)
+              );
+              if (currentSpeakerRef.current === msg.from) {
+                currentSpeakerRef.current = msg.into;
+              }
+              return;
             }
-          }
-        } catch (err) {
-          console.error('Diarization message parsing error:', err);
-        }
-      };
+            if (msg.type === 'diarization') {
+              console.log('Diarization Speaker Detected:', msg.speaker);
+              if (msg.speaker === 'SILENCE') {
+                setStatusMessage('✨ 대화 대기 중... (음소거 상태)');
+              } else {
+                const prevSpeaker = currentSpeakerRef.current;
+                const nextSpeaker = msg.speaker;
 
-      backendWs.onclose = () => {
-        console.log('Disconnected from local diarization backend');
-      };
+                // 화자가 변경된 경우 기존 발화 스트림을 쪼갬 (이전 화자가 SPEAKER_XX 였을 때만)
+                if (prevSpeaker !== nextSpeaker && prevSpeaker !== 'SILENCE') {
+                  console.log(`Speaker changed from ${prevSpeaker} to ${nextSpeaker}. Splitting translation session.`);
+                  for (const session of sessionsRef.current) {
+                    session.splitTurn();
+                  }
+                  // 기존 말풍선들을 동결(frozen) 처리하여 이후 화자 보정에 영향을 받지 않도록 보호
+                  setTranscripts((prev) => 
+                    prev.map((it) => it.type === 'input' ? { ...it, frozen: true } : it)
+                  );
+                }
+
+                // 실시간 화자 ID 캐시 업데이트
+                currentSpeakerRef.current = nextSpeaker;
+                setStatusMessage(`🗣️ 화자 감지됨: ${nextSpeaker} (실시간 통역 진행 중)`);
+                
+                // 가장 최근의 input 말풍선의 speaker를 동적으로 교체하여 시간차 보정 (동결되지 않은 경우만)
+                setTranscripts((prev) => {
+                  if (prev.length === 0) return prev;
+                  const updated = [...prev];
+                  for (let i = updated.length - 1; i >= 0; i--) {
+                    if (updated[i].type === 'input') {
+                      if (!updated[i].frozen) {
+                        updated[i].speaker = nextSpeaker;
+                      }
+                      break;
+                    }
+                  }
+                  return updated;
+                });
+              }
+            }
+          } catch (err) {
+            console.error('Diarization message parsing error:', err);
+          }
+        };
+
+        backendWs.onclose = () => {
+          console.log('Disconnected from local diarization backend');
+        };
+      }
 
       // 1. 마이크/시스템 오디오 레코더 준비 — 받은 청크를 Gemini 세션 및 로컬 백엔드에 모두 전달
       recorderRef.current = new AudioRecorder((chunk: ArrayBuffer) => {
@@ -178,8 +250,8 @@ function App() {
         for (const session of sessionsRef.current) {
           session.sendAudioBase64(base64Data);
         }
-        // 로컬 화자 분할 백엔드로 전송 (바이너리)
-        if (backendWsRef.current && backendWsRef.current.readyState === WebSocket.OPEN) {
+        // 단방향 모드일 때만 로컬 화자 분할 백엔드로 전송 (바이너리)
+        if (mode !== 'dual' && backendWsRef.current && backendWsRef.current.readyState === WebSocket.OPEN) {
           backendWsRef.current.send(chunk);
         }
       });
@@ -200,18 +272,45 @@ function App() {
         // 대면 양방향: 서로 반대 타깃 2세션, echo=false → 이미 타깃 언어인 입력은 침묵 처리되어 중복 방지
         // 세션A(target=langB): langA 화자의 말을 langB로 번역 → 상대(B)쪽 자막
         const sessionA = new TranslationSession(
-          { apiKey, targetLang: langB, echoTargetLanguage: false, autoReconnect: true, volume: effectiveVolume, emitInputTranscript: false, voiceName },
+          { 
+            apiKey, 
+            targetLang: langB, 
+            echoTargetLanguage: false, 
+            autoReconnect: true, 
+            volume: effectiveVolume, 
+            emitInputTranscript: false, 
+            voiceName: voiceNameA,
+            getCurrentSpeaker: () => currentSpeakerRef.current 
+          },
           { onStatus: handleSessionStatus, onTranscript: (t) => upsertTranscript(t, 'B') }
         );
         // 세션B(target=langA): langB 화자의 말을 langA로 번역 → 내(A)쪽 자막
         const sessionB = new TranslationSession(
-          { apiKey, targetLang: langA, echoTargetLanguage: false, autoReconnect: true, volume: effectiveVolume, emitInputTranscript: false, voiceName },
+          { 
+            apiKey, 
+            targetLang: langA, 
+            echoTargetLanguage: false, 
+            autoReconnect: true, 
+            volume: effectiveVolume, 
+            emitInputTranscript: false, 
+            voiceName: voiceNameB,
+            getCurrentSpeaker: () => currentSpeakerRef.current 
+          },
           { onStatus: handleSessionStatus, onTranscript: (t) => upsertTranscript(t, 'A') }
         );
         sessionsRef.current = [sessionA, sessionB];
       } else {
         const session = new TranslationSession(
-          { apiKey, targetLang, echoTargetLanguage: echoTarget, autoReconnect: true, volume: effectiveVolume, emitInputTranscript: true, voiceName },
+          { 
+            apiKey, 
+            targetLang, 
+            echoTargetLanguage: echoTarget, 
+            autoReconnect: true, 
+            volume: effectiveVolume, 
+            emitInputTranscript: true, 
+            voiceName: voiceNameA,
+            getCurrentSpeaker: () => currentSpeakerRef.current 
+          },
           { onStatus: handleSessionStatus, onTranscript: (t) => upsertTranscript(t) }
         );
         sessionsRef.current = [session];
@@ -248,30 +347,64 @@ function App() {
     sessionsRef.current = [];
   };
 
-  const renderBubble = (item: TranscriptItem) => (
-    <div
-      key={item.id}
-      style={{
-        ...styles.bubbleCard,
-        alignSelf: item.type === 'input' ? 'flex-start' : 'flex-end',
-        borderLeft: item.type === 'input' ? '3px solid var(--accent-purple)' : '3px solid var(--accent-cyan)',
-        backgroundColor: item.type === 'input' ? 'rgba(139, 92, 246, 0.08)' : 'rgba(6, 182, 212, 0.08)',
-      }}
-    >
-      <div style={styles.bubbleHeader}>
-        <span style={styles.bubbleRole}>
-          {item.type === 'input' ? '🗣️ 내 음성' : '🤖 번역 결과'}
+  const renderBubble = (item: TranscriptItem) => {
+    const isInput = item.type === 'input';
+    
+    // 화자 ID 기반 동적 색상 색출 (3인 이상 확장 대응)
+    let speakerColor = 'var(--accent-purple)';
+    let speakerBgColor = 'rgba(139, 92, 246, 0.08)';
+    
+    if (item.speaker) {
+      let hash = 0;
+      for (let i = 0; i < item.speaker.length; i++) {
+        hash = item.speaker.charCodeAt(i) + ((hash << 5) - hash);
+      }
+      const colors = [
+        { border: 'var(--accent-purple)', bg: 'rgba(139, 92, 246, 0.08)' },
+        { border: 'var(--accent-cyan)', bg: 'rgba(6, 182, 212, 0.08)' },
+        { border: 'var(--accent-pink)', bg: 'rgba(236, 72, 153, 0.08)' },
+        { border: 'var(--accent-yellow)', bg: 'rgba(234, 179, 8, 0.08)' },
+      ];
+      const index = Math.abs(hash) % colors.length;
+      speakerColor = colors[index].border;
+      speakerBgColor = colors[index].bg;
+    }
+    
+    const borderLeftColor = isInput 
+      ? `3px solid ${speakerColor}` 
+      : '3px solid var(--accent-green)';
+      
+    const backgroundColor = isInput 
+      ? speakerBgColor 
+      : 'rgba(16, 185, 129, 0.08)';
+
+    return (
+      <div
+        key={item.id}
+        style={{
+          ...styles.bubbleCard,
+          alignSelf: isInput ? 'flex-start' : 'flex-end',
+          borderLeft: borderLeftColor,
+          backgroundColor: backgroundColor,
+        }}
+      >
+        <div style={styles.bubbleHeader}>
+          <span style={styles.bubbleRole}>
+            {isInput 
+              ? `🗣️ 내 음성 ${item.speaker ? `(${item.speaker})` : ''}` 
+              : '🤖 번역 결과'}
+          </span>
+          {item.langCode && (
+            <span style={styles.bubbleLang}>{item.langCode.toUpperCase()}</span>
+          )}
+        </div>
+        <p style={styles.bubbleText}>{item.text}</p>
+        <span style={styles.bubbleTime}>
+          {item.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
         </span>
-        {item.langCode && (
-          <span style={styles.bubbleLang}>{item.langCode.toUpperCase()}</span>
-        )}
       </div>
-      <p style={styles.bubbleText}>{item.text}</p>
-      <span style={styles.bubbleTime}>
-        {item.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-      </span>
-    </div>
-  );
+    );
+  };
 
   // 대면 양방향: 한 화자 쪽 자막 패널 (가장 최근 발화 위주로 크게 표시)
   const renderDualSide = (side: 'A' | 'B', langCode: string) => {
@@ -356,10 +489,25 @@ function App() {
             </div>
 
             <div style={styles.fieldRow}>
+              <label style={styles.label}>화자 식별 수 (상한 설정)</label>
+              <select
+                value={maxSpeakers}
+                onChange={(e) => setMaxSpeakers(Number(e.target.value))}
+                style={styles.select}
+                disabled={isTranslating}
+              >
+                <option value={0}>⚙️ 자동 (자기 치유 병합 모드)</option>
+                <option value={2}>👥 2명 고정</option>
+                <option value={3}>👪 3명 고정</option>
+                <option value={4}>👨‍👩‍👧‍👦 4명 고정</option>
+              </select>
+            </div>
+
+            <div style={styles.fieldRow}>
               <label style={styles.label}>번역 음성 목소리 (성별)</label>
               <select
-                value={voiceName}
-                onChange={(e) => setVoiceName(e.target.value)}
+                value={voiceNameA}
+                onChange={(e) => setVoiceNameA(e.target.value)}
                 style={styles.select}
                 disabled={isTranslating}
               >
@@ -430,6 +578,32 @@ function App() {
                   {SUPPORTED_LANGUAGES.map((lang) => (
                     <option key={lang.code} value={lang.code}>{lang.name}</option>
                   ))}
+                </select>
+              </div>
+            </div>
+            <div style={styles.gridRow}>
+              <div style={styles.fieldCol}>
+                <label style={styles.label}>내 목소리 번역음 (A)</label>
+                <select
+                  value={voiceNameA}
+                  onChange={(e) => setVoiceNameA(e.target.value)}
+                  style={styles.select}
+                  disabled={isTranslating}
+                >
+                  <option value="Kore">👩 여성 음성 (Kore)</option>
+                  <option value="Puck">👨 남성 음성 (Puck)</option>
+                </select>
+              </div>
+              <div style={styles.fieldCol}>
+                <label style={styles.label}>상대 목소리 번역음 (B)</label>
+                <select
+                  value={voiceNameB}
+                  onChange={(e) => setVoiceNameB(e.target.value)}
+                  style={styles.select}
+                  disabled={isTranslating}
+                >
+                  <option value="Kore">👩 여성 음성 (Kore)</option>
+                  <option value="Puck">👨 남성 음성 (Puck)</option>
                 </select>
               </div>
             </div>
