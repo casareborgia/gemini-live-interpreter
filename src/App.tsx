@@ -189,12 +189,9 @@ function App() {
   }, [callOutboundSinkId]);
 
   /**
-   * 통역 세션 중지 및 모든 자원 해제
+   * 레코더/세션/백엔드 소켓 등 모든 자원만 해제 (UI 상태는 건드리지 않음 — 언마운트 정리용)
    */
-  const stopTranslationSession = useCallback(() => {
-    setIsTranslating(false);
-    setStatusMessage('통역 세션이 중지되었습니다.');
-
+  const releaseResources = useCallback(() => {
     // 모든 레코더 정지
     for (const rec of recordersRef.current) {
       try {
@@ -226,17 +223,31 @@ function App() {
     sessionsRef.current = [];
     inboundSessionRef.current = null;
     outboundSessionRef.current = null;
-
-    setInboundStatus({ state: 'closed' });
-    setOutboundStatus({ state: 'closed' });
   }, []);
 
-  // 컴포넌트 언마운트 시 클린업
+  /**
+   * 통역 세션 중지: 자원 해제 + UI 상태 갱신.
+   * message 를 주면 그 메시지를 표시 (오류 원인이 기본 문구에 덮어써지지 않도록).
+   */
+  const stopTranslationSession = useCallback(
+    (message?: string) => {
+      releaseResources();
+      setIsTranslating(false);
+      setStatusMessage(typeof message === 'string' ? message : '통역 세션이 중지되었습니다.');
+      // 실제로 열려 있던 세션은 onStatus('closed') 콜백이 '종료됨'으로 갱신하고,
+      // 연결 전에 실패한 세션은 대기 상태로 되돌린다.
+      setInboundStatus({ state: 'idle' });
+      setOutboundStatus({ state: 'idle' });
+    },
+    [releaseResources]
+  );
+
+  // 컴포넌트 언마운트 시 자원만 정리 (StrictMode 이중 마운트에서 UI 상태가 바뀌지 않도록)
   useEffect(() => {
     return () => {
-      stopTranslationSession();
+      releaseResources();
     };
-  }, [stopTranslationSession]);
+  }, [releaseResources]);
 
   // 세션이 보내온 자막(누적 텍스트) upsert (single/dual 모드용)
   const upsertTranscript = (t: SessionTranscript, side?: 'A' | 'B') => {
@@ -297,10 +308,9 @@ function App() {
     } else if (state === 'reconnecting') {
       setStatusMessage(`⚠️ 연결이 끊겨 재연결 시도 중입니다 (${detail?.attempt}/5)...`);
     } else if (state === 'closed' && !detail?.clean) {
-      setStatusMessage(
+      stopTranslationSession(
         `⚠️ 연결이 종료되었습니다 (코드: ${detail?.code}). API 키 권한/모델 지원을 확인하세요.`
       );
-      stopTranslationSession();
     }
   };
 
@@ -408,6 +418,8 @@ function App() {
           const base64Data = arrayBufferToBase64(chunk);
           inboundSession.sendAudioBase64(base64Data);
         });
+        // start 를 기다리기 전에 등록해야, 송신 레코더가 실패해도 화면 캡처가 정리된다
+        recordersRef.current.push(inboundRecorder);
         await inboundRecorder.start({ source: 'system' });
 
         // 4. 송신 레코더 시작 (내 마이크 오디오 캡처)
@@ -416,12 +428,11 @@ function App() {
           const base64Data = arrayBufferToBase64(chunk);
           outboundSession.sendAudioBase64(base64Data);
         });
+        recordersRef.current.push(outboundRecorder);
         await outboundRecorder.start({
           source: 'mic',
           deviceId: callMicDeviceId || undefined,
         });
-
-        recordersRef.current = [inboundRecorder, outboundRecorder];
 
         // 5. 세션 WebSocket 연결 시작 (화자 분할 WS는 통화 모드에서 미사용)
         inboundSession.connect();
@@ -576,8 +587,7 @@ function App() {
     } catch (error: unknown) {
       console.error(error);
       const errMsg = error instanceof Error ? error.message : String(error);
-      setStatusMessage(`⚠️ 초기화 실패: ${errMsg}`);
-      stopTranslationSession();
+      stopTranslationSession(`⚠️ 초기화 실패: ${errMsg}`);
     }
   };
 
@@ -926,7 +936,7 @@ function App() {
         </div>
 
         <button
-          onClick={isTranslating ? stopTranslationSession : startTranslationSession}
+          onClick={() => (isTranslating ? stopTranslationSession() : startTranslationSession())}
           style={{
             ...styles.actionButton,
             backgroundColor: isTranslating ? 'var(--accent-red)' : 'var(--accent-purple)',
@@ -1108,7 +1118,7 @@ const styles: Record<string, React.CSSProperties> = {
   modeButtonActive: {
     color: '#ffffff',
     background: 'var(--accent-purple)',
-    borderColor: 'var(--accent-purple)',
+    border: '1px solid var(--accent-purple)',
   },
   dualPanel: {
     flexGrow: 1,
