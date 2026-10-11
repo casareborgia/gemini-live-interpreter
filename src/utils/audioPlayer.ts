@@ -1,5 +1,6 @@
 /**
  * Gemini Live API에서 수신된 24kHz PCM 오디오 데이터를 자연스럽게 재생하기 위한 플레이어
+ * (출력 장치 지정 setSinkId 지원)
  */
 export class AudioPlayer {
   private audioContext: AudioContext | null = null;
@@ -8,26 +9,67 @@ export class AudioPlayer {
   private pitchSemitones: number = 0; // 번역 음성 출력 음높이 (반음 단위)
   private nextPlayTime: number = 0;
   private sampleRate: number = 24000; // Gemini Live API 출력 기본값 24kHz
+  private sinkId: string = ''; // 출력 장치 ID (BlackHole 또는 특정 오디오 인터페이스)
   // 현재 스케줄되어 재생 대기/진행 중인 소스 노드들 (밀렸을 때 버리고 따라잡기 위해 추적)
   private scheduledSources: Set<AudioBufferSourceNode> = new Set();
 
   // 재생 대기열이 이 시간(초) 이상 밀리면 밀린 음성을 버리고 최신 위치로 점프해 원본과 싱크 유지
   private static readonly MAX_BACKLOG = 1.2;
 
-  constructor() {}
+  constructor(sinkId?: string) {
+    if (sinkId) {
+      this.sinkId = sinkId;
+    }
+  }
 
   /**
-   * 플레이어 초기화 (첫 재생 전 오디오 컨텍스트 확보)
+   * 플레이어 초기화 (첫 재생 전 오디오 컨텍스트 확보 및 sinkId 적용)
    */
   init(): void {
     if (this.audioContext) return;
-    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    const AudioContextClass =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+
     this.audioContext = new AudioContextClass({ sampleRate: this.sampleRate });
+
+    // sinkId가 설정되어 있다면 적용 시도
+    if (this.sinkId) {
+      this.applySinkIdToContext(this.sinkId);
+    }
+
     // 모든 음성 소스가 거쳐 가는 볼륨 조절용 GainNode
     this.gainNode = this.audioContext.createGain();
     this.gainNode.gain.value = this.volume;
     this.gainNode.connect(this.audioContext.destination);
     this.nextPlayTime = this.audioContext.currentTime;
+  }
+
+  /**
+   * 출력 오디오 장치(sinkId)를 동적으로 변경합니다.
+   * AudioContext가 아직 초기화되지 않은 경우 저장해두었다가 init() 시 적용합니다.
+   */
+  async setSinkId(deviceId: string): Promise<void> {
+    this.sinkId = deviceId;
+    if (!this.audioContext) return;
+    await this.applySinkIdToContext(deviceId);
+  }
+
+  private async applySinkIdToContext(deviceId: string): Promise<void> {
+    if (!this.audioContext) return;
+
+    const ctx = this.audioContext as unknown as { setSinkId?: (id: string) => Promise<void> };
+    if (typeof ctx.setSinkId !== 'function') {
+      console.warn('이 브라우저의 AudioContext는 setSinkId(출력 장치 지정)를 지원하지 않습니다.');
+      return;
+    }
+
+    try {
+      await ctx.setSinkId(deviceId);
+    } catch (err: unknown) {
+      console.warn('AudioContext.setSinkId 적용 실패:', err);
+    }
   }
 
   /**
@@ -90,7 +132,7 @@ export class AudioPlayer {
     // 4. 버퍼 소스 노드를 볼륨 노드를 거쳐 스케줄링에 맞춰 연결 및 실행
     const sourceNode = this.audioContext.createBufferSource();
     sourceNode.buffer = audioBuffer;
-    
+
     // 피치 변조 (playbackRate 조정)
     const rate = Math.pow(2, this.pitchSemitones / 12);
     sourceNode.playbackRate.value = rate;
@@ -129,7 +171,7 @@ export class AudioPlayer {
   stop(): void {
     this.flushScheduled();
     if (this.audioContext) {
-      this.audioContext.close();
+      this.audioContext.close().catch(() => {});
     }
     this.audioContext = null;
     this.gainNode = null;

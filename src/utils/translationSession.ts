@@ -3,7 +3,8 @@ import { AudioPlayer } from './audioPlayer';
 /**
  * 하나의 Gemini Live 번역 WebSocket 세션을 캡슐화.
  * - 단방향(영상 더빙/마이크)에서는 1개,
- * - 대면 양방향 통역에서는 서로 반대 타깃으로 2개를 띄워 사용한다.
+ * - 대면 양방향 통역에서는 서로 반대 타깃으로 2개,
+ * - 영상통화(Call Mode)에서는 수신/송신 각 1개씩 띄워 사용한다.
  */
 
 export interface SessionTranscript {
@@ -15,7 +16,10 @@ export interface SessionTranscript {
 
 export interface TranslationSessionCallbacks {
   /** 연결/재연결/오류 등 상태 변화 */
-  onStatus?: (state: 'open' | 'reconnecting' | 'closed', detail?: { code?: number; clean?: boolean; attempt?: number }) => void;
+  onStatus?: (
+    state: 'open' | 'reconnecting' | 'closed',
+    detail?: { code?: number; clean?: boolean; attempt?: number }
+  ) => void;
   /** 자막(누적된 전체 텍스트)이 갱신될 때마다 호출. App은 id 기준으로 upsert */
   onTranscript?: (t: SessionTranscript) => void;
 }
@@ -30,8 +34,35 @@ export interface TranslationSessionOptions {
   emitInputTranscript?: boolean;
   /** 번역 음성 출력 목소리 이름 (예: Puck, Kore 등) */
   voiceName?: string;
+  /** 출력 장치 식별자 (BlackHole 가상 케이블 등) */
+  sinkId?: string;
   /** 현재 감지된 화자 정보를 가져오기 위한 콜백 */
   getCurrentSpeaker?: () => string;
+}
+
+interface ServerContentTranscription {
+  text?: string;
+  languageCode?: string;
+  language_code?: string;
+}
+
+interface ServerContentPart {
+  inlineData?: {
+    mimeType?: string;
+    data: string;
+  };
+}
+
+interface ServerContent {
+  inputTranscription?: ServerContentTranscription;
+  input_transcription?: ServerContentTranscription;
+  outputTranscription?: ServerContentTranscription;
+  output_transcription?: ServerContentTranscription;
+  modelTurn?: {
+    parts?: ServerContentPart[];
+  };
+  turnComplete?: boolean;
+  generationComplete?: boolean;
 }
 
 const MODEL_NAME = 'gemini-3.5-live-translate-preview';
@@ -55,7 +86,7 @@ export class TranslationSession {
   constructor(opts: TranslationSessionOptions, cb: TranslationSessionCallbacks = {}) {
     this.opts = opts;
     this.cb = cb;
-    this.player = new AudioPlayer();
+    this.player = new AudioPlayer(opts.sinkId);
   }
 
   /** 세션 시작 (오디오 플레이어 + WebSocket 연결) */
@@ -63,17 +94,22 @@ export class TranslationSession {
     this.closedByUser = false;
     this.player.init();
     this.player.setVolume(this.opts.volume ?? 1);
+    if (this.opts.sinkId) {
+      this.player.setSinkId(this.opts.sinkId).catch(() => {});
+    }
     this.openSocket();
   }
 
   /** 마이크/시스템 오디오 청크(base64 PCM 16k)를 서버로 전송 */
   sendAudioBase64(base64Data: string): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        realtimeInput: {
-          mediaChunks: [{ data: base64Data, mimeType: 'audio/pcm;rate=16000' }],
-        },
-      }));
+      this.ws.send(
+        JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{ data: base64Data, mimeType: 'audio/pcm;rate=16000' }],
+          },
+        })
+      );
     }
   }
 
@@ -81,10 +117,20 @@ export class TranslationSession {
     this.player.setVolume(volume);
   }
 
+  /** 출력 오디오 장치(sinkId)를 변경 */
+  async setSinkId(deviceId: string): Promise<void> {
+    this.opts.sinkId = deviceId;
+    await this.player.setSinkId(deviceId);
+  }
+
   /** 사용자가 의도적으로 종료 (자동 재연결 안 함) */
   close(): void {
     this.closedByUser = true;
-    try { this.player.stop(); } catch { /* noop */ }
+    try {
+      this.player.stop();
+    } catch {
+      /* noop */
+    }
     if (this.ws) {
       if (this.ws.readyState === WebSocket.OPEN) this.ws.close();
       this.ws = null;
@@ -94,10 +140,10 @@ export class TranslationSession {
   private buildWsUrl(): string {
     const isSecure = window.location.protocol === 'https:';
     const wsProtocol = isSecure ? 'wss:' : 'ws:';
-    
+
     const isProduction = import.meta.env.PROD;
     let backendHost = window.location.host;
-    
+
     if (isProduction) {
       const envBackendUrl = import.meta.env.VITE_BACKEND_URL;
       if (envBackendUrl) {
@@ -110,18 +156,20 @@ export class TranslationSession {
     } else {
       backendHost = 'localhost:8000';
     }
-    
+
     return `${wsProtocol}//${backendHost}/ws-api/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`;
   }
 
   private buildSetupMessage() {
-    const voiceConfig = this.opts.voiceName ? {
-      voiceConfig: {
-        prebuiltVoiceConfig: {
-          voiceName: this.opts.voiceName,
-        },
-      },
-    } : undefined;
+    const voiceConfig = this.opts.voiceName
+      ? {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              voiceName: this.opts.voiceName,
+            },
+          },
+        }
+      : undefined;
 
     return {
       setup: {
@@ -167,7 +215,9 @@ export class TranslationSession {
         // Gemini Live 서버는 응답을 바이너리(Blob) 프레임으로 보내므로 텍스트로 변환 후 파싱
         const raw = event.data instanceof Blob ? await event.data.text() : event.data;
         const response = JSON.parse(raw);
-        if (response.serverContent) this.handleServerContent(response.serverContent);
+        if (response.serverContent) {
+          this.handleServerContent(response.serverContent as ServerContent);
+        }
       } catch (err) {
         console.error('웹소켓 메시지 파싱 오류:', err);
       }
@@ -197,7 +247,7 @@ export class TranslationSession {
     };
   }
 
-  private handleServerContent(content: any): void {
+  private handleServerContent(content: ServerContent): void {
     // 입력(원문) 자막 누적
     if (this.opts.emitInputTranscript !== false) {
       const inT = content.inputTranscription ?? content.input_transcription;
@@ -264,7 +314,10 @@ export class TranslationSession {
 }
 
 function randomId(): string {
-  return Math.random().toString(36).substr(2, 9);
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return Math.random().toString(36).substring(2, 11);
 }
 
 function getPitchForSpeaker(speaker: string): number {

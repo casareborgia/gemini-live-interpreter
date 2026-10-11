@@ -1,6 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { AudioRecorder } from './utils/audioRecorder';
 import { TranslationSession, type SessionTranscript } from './utils/translationSession';
+import { CallSettings } from './components/CallSettings';
+import {
+  CallTranscriptView,
+  type CallTranscriptMessage,
+} from './components/CallTranscriptView';
 
 interface TranscriptItem {
   id: string;
@@ -9,12 +14,12 @@ interface TranscriptItem {
   langCode?: string;
   timestamp: Date;
   side?: 'A' | 'B'; // 대면 양방향 모드에서 어느 화자 쪽 자막인지
-  speaker?: string;  // 화자 식별 정보 (SPEAKER_00, SPEAKER_01 등)
-  frozen?: boolean;  // 화자 전환으로 인해 해당 턴이 닫혔는지 여부
+  speaker?: string; // 화자 식별 정보 (SPEAKER_00, SPEAKER_01 등)
+  frozen?: boolean; // 화자 전환으로 인해 해당 턴이 닫혔는지 여부
 }
 
-// 통역 모드: single = 영상 더빙/마이크 단방향, dual = 대면 양방향
-type Mode = 'single' | 'dual';
+// 통역 모드: single = 영상 더빙/마이크 단방향, dual = 대면 양방향, call = 영상통화 양방향
+type Mode = 'single' | 'dual' | 'call';
 
 function arrayBufferToBase64(buf: ArrayBuffer): string {
   const bytes = new Uint8Array(buf);
@@ -40,6 +45,11 @@ const SUPPORTED_LANGUAGES = [
 // 통역할 소리를 어디서 가져올지: 내 마이크 vs 재생 중인 영상/탭 소리
 type InputSource = 'mic' | 'system';
 
+interface SessionStatusState {
+  state: 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
+  detail?: string;
+}
+
 function App() {
   const [apiKey, setApiKey] = useState<string>(() => {
     return localStorage.getItem('GEMINI_LIVE_API_KEY') || '';
@@ -50,7 +60,11 @@ function App() {
   const [langB, setLangB] = useState<string>('en'); // 대면 양방향: 상대 언어
   const [inputSource, setInputSource] = useState<InputSource>('mic');
   const [voiceNameA, setVoiceNameA] = useState<string>(() => {
-    return localStorage.getItem('GEMINI_LIVE_VOICE_NAME_A') || localStorage.getItem('GEMINI_LIVE_VOICE_NAME') || 'Kore';
+    return (
+      localStorage.getItem('GEMINI_LIVE_VOICE_NAME_A') ||
+      localStorage.getItem('GEMINI_LIVE_VOICE_NAME') ||
+      'Kore'
+    );
   });
   const [voiceNameB, setVoiceNameB] = useState<string>(() => {
     return localStorage.getItem('GEMINI_LIVE_VOICE_NAME_B') || 'Puck'; // 기본값 남성 Puck
@@ -65,8 +79,37 @@ function App() {
     return Number(localStorage.getItem('GEMINI_LIVE_MAX_SPEAKERS')) || 0; // 기본값 0 (자동)
   });
 
-  const recorderRef = useRef<AudioRecorder | null>(null);
+  // 영상통화(Call Mode) 설정 상태
+  const [callMyLang, setCallMyLang] = useState<string>(() => {
+    return localStorage.getItem('GEMINI_LIVE_CALL_MY_LANG') || 'ko';
+  });
+  const [callRemoteLang, setCallRemoteLang] = useState<string>(() => {
+    return localStorage.getItem('GEMINI_LIVE_CALL_REMOTE_LANG') || 'en';
+  });
+  const [callMicDeviceId, setCallMicDeviceId] = useState<string>(() => {
+    return localStorage.getItem('GEMINI_LIVE_CALL_MIC_DEVICE_ID') || '';
+  });
+  const [callInboundSinkId, setCallInboundSinkId] = useState<string>(() => {
+    return localStorage.getItem('GEMINI_LIVE_CALL_INBOUND_SINK_ID') || '';
+  });
+  const [callOutboundSinkId, setCallOutboundSinkId] = useState<string>(() => {
+    return localStorage.getItem('GEMINI_LIVE_CALL_OUTBOUND_SINK_ID') || '';
+  });
+  const [callInboundAudio, setCallInboundAudio] = useState<boolean>(() => {
+    return localStorage.getItem('GEMINI_LIVE_CALL_INBOUND_AUDIO') !== 'false';
+  });
+
+  // 영상통화 모드 전용 자막 및 상태
+  const [inboundTranscripts, setInboundTranscripts] = useState<CallTranscriptMessage[]>([]);
+  const [outboundTranscripts, setOutboundTranscripts] = useState<CallTranscriptMessage[]>([]);
+  const [inboundStatus, setInboundStatus] = useState<SessionStatusState>({ state: 'idle' });
+  const [outboundStatus, setOutboundStatus] = useState<SessionStatusState>({ state: 'idle' });
+
+  // 세션 및 파이프라인 Ref
+  const recordersRef = useRef<AudioRecorder[]>([]);
   const sessionsRef = useRef<TranslationSession[]>([]);
+  const inboundSessionRef = useRef<TranslationSession | null>(null);
+  const outboundSessionRef = useRef<TranslationSession | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const backendWsRef = useRef<WebSocket | null>(null);
   const currentSpeakerRef = useRef<string>('SPEAKER_00');
@@ -74,12 +117,11 @@ function App() {
   // 실제 적용되는 출력 볼륨 (자막 전용이면 0)
   const effectiveVolume = subtitleOnly ? 0 : outputVolume;
 
-  // 로컬 스토리지에 API 키 저장
+  // 로컬 스토리지 동기화
   useEffect(() => {
     localStorage.setItem('GEMINI_LIVE_API_KEY', apiKey);
   }, [apiKey]);
 
-  // 로컬 스토리지에 보이스 이름 저장
   useEffect(() => {
     localStorage.setItem('GEMINI_LIVE_VOICE_NAME_A', voiceNameA);
   }, [voiceNameA]);
@@ -92,29 +134,113 @@ function App() {
     localStorage.setItem('GEMINI_LIVE_MAX_SPEAKERS', String(maxSpeakers));
   }, [maxSpeakers]);
 
+  useEffect(() => {
+    localStorage.setItem('GEMINI_LIVE_CALL_MY_LANG', callMyLang);
+  }, [callMyLang]);
+
+  useEffect(() => {
+    localStorage.setItem('GEMINI_LIVE_CALL_REMOTE_LANG', callRemoteLang);
+  }, [callRemoteLang]);
+
+  useEffect(() => {
+    localStorage.setItem('GEMINI_LIVE_CALL_MIC_DEVICE_ID', callMicDeviceId);
+  }, [callMicDeviceId]);
+
+  useEffect(() => {
+    localStorage.setItem('GEMINI_LIVE_CALL_INBOUND_SINK_ID', callInboundSinkId);
+  }, [callInboundSinkId]);
+
+  useEffect(() => {
+    localStorage.setItem('GEMINI_LIVE_CALL_OUTBOUND_SINK_ID', callOutboundSinkId);
+  }, [callOutboundSinkId]);
+
+  useEffect(() => {
+    localStorage.setItem('GEMINI_LIVE_CALL_INBOUND_AUDIO', String(callInboundAudio));
+  }, [callInboundAudio]);
+
   // 대화 기록 추가 시 자동 스크롤
   useEffect(() => {
     timelineEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [transcripts]);
 
-  // 볼륨/자막전용 변경 시 진행 중인 모든 세션에 즉시 반영
+  // 볼륨 변경 시 진행 중인 세션에 즉시 반영
   useEffect(() => {
-    for (const session of sessionsRef.current) {
-      session.setVolume(effectiveVolume);
+    if (mode === 'call') {
+      inboundSessionRef.current?.setVolume(callInboundAudio ? effectiveVolume : 0);
+      outboundSessionRef.current?.setVolume(effectiveVolume);
+    } else {
+      for (const session of sessionsRef.current) {
+        session.setVolume(effectiveVolume);
+      }
     }
-  }, [effectiveVolume]);
+  }, [effectiveVolume, callInboundAudio, mode]);
+
+  // 통화 모드 출력 장치 변경 시 즉시 반영
+  useEffect(() => {
+    if (inboundSessionRef.current) {
+      inboundSessionRef.current.setSinkId(callInboundSinkId).catch(() => {});
+    }
+  }, [callInboundSinkId]);
+
+  useEffect(() => {
+    if (outboundSessionRef.current) {
+      outboundSessionRef.current.setSinkId(callOutboundSinkId).catch(() => {});
+    }
+  }, [callOutboundSinkId]);
+
+  /**
+   * 통역 세션 중지 및 모든 자원 해제
+   */
+  const stopTranslationSession = useCallback(() => {
+    setIsTranslating(false);
+    setStatusMessage('통역 세션이 중지되었습니다.');
+
+    // 모든 레코더 정지
+    for (const rec of recordersRef.current) {
+      try {
+        rec.stop();
+      } catch {
+        /* noop */
+      }
+    }
+    recordersRef.current = [];
+
+    // 화자 분할 WebSocket 정리
+    if (backendWsRef.current) {
+      try {
+        backendWsRef.current.close();
+      } catch {
+        /* noop */
+      }
+      backendWsRef.current = null;
+    }
+
+    // 모든 세션 정리
+    for (const session of sessionsRef.current) {
+      try {
+        session.close();
+      } catch {
+        /* noop */
+      }
+    }
+    sessionsRef.current = [];
+    inboundSessionRef.current = null;
+    outboundSessionRef.current = null;
+
+    setInboundStatus({ state: 'closed' });
+    setOutboundStatus({ state: 'closed' });
+  }, []);
 
   // 컴포넌트 언마운트 시 클린업
   useEffect(() => {
     return () => {
       stopTranslationSession();
     };
-  }, []);
+  }, [stopTranslationSession]);
 
-  // 세션이 보내온 자막(이미 누적된 전체 텍스트)을 id 기준으로 추가/갱신
+  // 세션이 보내온 자막(누적 텍스트) upsert (single/dual 모드용)
   const upsertTranscript = (t: SessionTranscript, side?: 'A' | 'B') => {
     setTranscripts((prev) => {
-      // 기존에 이미 등록된 아이템이 있는지 먼저 확인 (화자 ID 유지를 위함)
       const idx = prev.findIndex((it) => it.id === t.id);
       const existingSpeaker = idx >= 0 ? prev[idx].speaker : undefined;
       const existingFrozen = idx >= 0 ? prev[idx].frozen : false;
@@ -126,8 +252,7 @@ function App() {
         langCode: t.langCode,
         timestamp: new Date(),
         side,
-        // 입력 자막에만 화자 ID 부여 (기존에 부여된 화자 ID가 있다면 재사용, 없으면 현재 실시간 감지 화자 부여)
-        speaker: t.role === 'input' ? (existingSpeaker || currentSpeakerRef.current) : undefined,
+        speaker: t.role === 'input' ? existingSpeaker || currentSpeakerRef.current : undefined,
         frozen: existingFrozen,
       };
       if (idx >= 0) {
@@ -139,7 +264,30 @@ function App() {
     });
   };
 
-  // 세션 연결 상태 변화 처리 (재연결/종료 등)
+  // 통화 모드 세션 자막 upsert
+  const upsertCallTranscript = (
+    setter: React.Dispatch<React.SetStateAction<CallTranscriptMessage[]>>,
+    t: SessionTranscript
+  ) => {
+    setter((prev) => {
+      const idx = prev.findIndex((it) => it.id === t.id);
+      const item: CallTranscriptMessage = {
+        id: t.id,
+        type: t.role,
+        text: t.text,
+        langCode: t.langCode,
+        timestamp: new Date(),
+      };
+      if (idx >= 0) {
+        const updated = [...prev];
+        updated[idx] = { ...prev[idx], ...item };
+        return updated;
+      }
+      return [...prev, item];
+    });
+  };
+
+  // 세션 연결 상태 변화 처리 (single / dual 모드용)
   const handleSessionStatus = (
     state: 'open' | 'reconnecting' | 'closed',
     detail?: { code?: number; clean?: boolean; attempt?: number }
@@ -149,7 +297,9 @@ function App() {
     } else if (state === 'reconnecting') {
       setStatusMessage(`⚠️ 연결이 끊겨 재연결 시도 중입니다 (${detail?.attempt}/5)...`);
     } else if (state === 'closed' && !detail?.clean) {
-      setStatusMessage(`⚠️ 연결이 종료되었습니다 (코드: ${detail?.code}). API 키 권한/모델 지원을 확인하세요.`);
+      setStatusMessage(
+        `⚠️ 연결이 종료되었습니다 (코드: ${detail?.code}). API 키 권한/모델 지원을 확인하세요.`
+      );
       stopTranslationSession();
     }
   };
@@ -159,34 +309,150 @@ function App() {
       setStatusMessage('⚠️ 먼저 Gemini API 키를 입력해 주세요.');
       return;
     }
+
     if (mode === 'dual' && langA === langB) {
       setStatusMessage('⚠️ 대면 통역은 서로 다른 두 언어를 선택해야 합니다.');
+      return;
+    }
+
+    if (mode === 'call' && callMyLang === callRemoteLang) {
+      setStatusMessage('⚠️ 영상통화 통역은 내 언어와 상대방 언어가 달라야 합니다.');
       return;
     }
 
     try {
       setIsTranslating(true);
 
-      // 단방향(영상 더빙) 모드일 때만 화자 분할 백엔드 연결
-      if (mode !== 'dual') {
+      // ==========================================
+      // Mode 3: 영상통화 통역 (Call Mode)
+      // ==========================================
+      if (mode === 'call') {
+        setStatusMessage('📞 영상통화 세션 준비 중...');
+        setInboundStatus({ state: 'connecting' });
+        setOutboundStatus({ state: 'connecting' });
+
+        // 1. 수신 세션 준비 (상대 소리 -> 내 언어 번역)
+        const inboundSession = new TranslationSession(
+          {
+            apiKey,
+            targetLang: callMyLang,
+            echoTargetLanguage: false,
+            emitInputTranscript: true,
+            autoReconnect: true,
+            volume: callInboundAudio ? effectiveVolume : 0,
+            voiceName: voiceNameB, // 상대 목소리용
+            sinkId: callInboundSinkId || undefined,
+          },
+          {
+            onStatus: (state, detail) => {
+              if (state === 'open') {
+                setInboundStatus({ state: 'open' });
+              } else if (state === 'reconnecting') {
+                setInboundStatus({
+                  state: 'reconnecting',
+                  detail: `재연결 중 (${detail?.attempt}/5)`,
+                });
+              } else if (state === 'closed') {
+                setInboundStatus({
+                  state: 'closed',
+                  detail: detail?.clean ? '종료됨' : `연결 끊김 (${detail?.code})`,
+                });
+                // 통화 모드에서는 한 세션이 닫혀도 다른 세션은 계속 유지!
+              }
+            },
+            onTranscript: (t) => upsertCallTranscript(setInboundTranscripts, t),
+          }
+        );
+
+        // 2. 송신 세션 준비 (내 소리 -> 상대 언어 번역)
+        const outboundSession = new TranslationSession(
+          {
+            apiKey,
+            targetLang: callRemoteLang,
+            echoTargetLanguage: false,
+            emitInputTranscript: true,
+            autoReconnect: true,
+            volume: effectiveVolume,
+            voiceName: voiceNameA, // 내 목소리용
+            sinkId: callOutboundSinkId || undefined,
+          },
+          {
+            onStatus: (state, detail) => {
+              if (state === 'open') {
+                setOutboundStatus({ state: 'open' });
+              } else if (state === 'reconnecting') {
+                setOutboundStatus({
+                  state: 'reconnecting',
+                  detail: `재연결 중 (${detail?.attempt}/5)`,
+                });
+              } else if (state === 'closed') {
+                setOutboundStatus({
+                  state: 'closed',
+                  detail: detail?.clean ? '종료됨' : `연결 끊김 (${detail?.code})`,
+                });
+              }
+            },
+            onTranscript: (t) => upsertCallTranscript(setOutboundTranscripts, t),
+          }
+        );
+
+        inboundSessionRef.current = inboundSession;
+        outboundSessionRef.current = outboundSession;
+        sessionsRef.current = [inboundSession, outboundSession];
+
+        // 3. 수신 레코더 시작 (시스템/창 오디오 캡처)
+        setStatusMessage(
+          '공유할 텔레그램 창/화면을 선택해 주세요 (오디오 공유 체크 필수)...'
+        );
+        const inboundRecorder = new AudioRecorder((chunk: ArrayBuffer) => {
+          const base64Data = arrayBufferToBase64(chunk);
+          inboundSession.sendAudioBase64(base64Data);
+        });
+        await inboundRecorder.start({ source: 'system' });
+
+        // 4. 송신 레코더 시작 (내 마이크 오디오 캡처)
+        setStatusMessage('내 마이크 연결 중...');
+        const outboundRecorder = new AudioRecorder((chunk: ArrayBuffer) => {
+          const base64Data = arrayBufferToBase64(chunk);
+          outboundSession.sendAudioBase64(base64Data);
+        });
+        await outboundRecorder.start({
+          source: 'mic',
+          deviceId: callMicDeviceId || undefined,
+        });
+
+        recordersRef.current = [inboundRecorder, outboundRecorder];
+
+        // 5. 세션 WebSocket 연결 시작 (화자 분할 WS는 통화 모드에서 미사용)
+        inboundSession.connect();
+        outboundSession.connect();
+
+        setStatusMessage('✨ 영상통화 양방향 통역이 활성화되었습니다.');
+        return;
+      }
+
+      // ==========================================
+      // Mode 1, 2: 단방향(single) 및 대면 양방향(dual)
+      // ==========================================
+      if (mode === 'single') {
         const isProduction = import.meta.env.PROD;
         const backendUrl = isProduction
-          ? (import.meta.env.VITE_BACKEND_URL || 'wss://translation-backend-517419857386.asia-northeast3.run.app')
+          ? (import.meta.env.VITE_BACKEND_URL ||
+              'wss://translation-backend-517419857386.asia-northeast3.run.app')
           : 'ws://localhost:8000';
         const backendWs = new WebSocket(`${backendUrl}/ws/audio?max_speakers=${maxSpeakers}`);
         backendWsRef.current = backendWs;
-        
+
         backendWs.onopen = () => {
           console.log('Connected to local diarization backend');
         };
-        
+
         backendWs.onmessage = (e) => {
           try {
             const msg = JSON.parse(e.data);
             if (msg.type === 'speaker_merged') {
-              console.log(`Speaker Merged: ${msg.from} -> ${msg.into}`);
-              setTranscripts((prev) => 
-                prev.map((it) => it.speaker === msg.from ? { ...it, speaker: msg.into } : it)
+              setTranscripts((prev) =>
+                prev.map((it) => (it.speaker === msg.from ? { ...it, speaker: msg.into } : it))
               );
               if (currentSpeakerRef.current === msg.from) {
                 currentSpeakerRef.current = msg.into;
@@ -194,30 +460,24 @@ function App() {
               return;
             }
             if (msg.type === 'diarization') {
-              console.log('Diarization Speaker Detected:', msg.speaker);
               if (msg.speaker === 'SILENCE') {
                 setStatusMessage('✨ 대화 대기 중... (음소거 상태)');
               } else {
                 const prevSpeaker = currentSpeakerRef.current;
                 const nextSpeaker = msg.speaker;
 
-                // 화자가 변경된 경우 기존 발화 스트림을 쪼갬 (이전 화자가 SPEAKER_XX 였을 때만)
                 if (prevSpeaker !== nextSpeaker && prevSpeaker !== 'SILENCE') {
-                  console.log(`Speaker changed from ${prevSpeaker} to ${nextSpeaker}. Splitting translation session.`);
                   for (const session of sessionsRef.current) {
                     session.splitTurn();
                   }
-                  // 기존 말풍선들을 동결(frozen) 처리하여 이후 화자 보정에 영향을 받지 않도록 보호
-                  setTranscripts((prev) => 
-                    prev.map((it) => it.type === 'input' ? { ...it, frozen: true } : it)
+                  setTranscripts((prev) =>
+                    prev.map((it) => (it.type === 'input' ? { ...it, frozen: true } : it))
                   );
                 }
 
-                // 실시간 화자 ID 캐시 업데이트
                 currentSpeakerRef.current = nextSpeaker;
                 setStatusMessage(`🗣️ 화자 감지됨: ${nextSpeaker} (실시간 통역 진행 중)`);
-                
-                // 가장 최근의 input 말풍선의 speaker를 동적으로 교체하여 시간차 보정 (동결되지 않은 경우만)
+
                 setTranscripts((prev) => {
                   if (prev.length === 0) return prev;
                   const updated = [...prev];
@@ -243,117 +503,90 @@ function App() {
         };
       }
 
-      // 1. 마이크/시스템 오디오 레코더 준비 — 받은 청크를 Gemini 세션 및 로컬 백엔드에 모두 전달
-      recorderRef.current = new AudioRecorder((chunk: ArrayBuffer) => {
-        // Gemini Live API로 전송 (Base64)
+      // 단일 레코더 준비 (single/dual 공용)
+      const recorder = new AudioRecorder((chunk: ArrayBuffer) => {
         const base64Data = arrayBufferToBase64(chunk);
         for (const session of sessionsRef.current) {
           session.sendAudioBase64(base64Data);
         }
-        // 단방향 모드일 때만 로컬 화자 분할 백엔드로 전송 (바이너리)
-        if (mode !== 'dual' && backendWsRef.current && backendWsRef.current.readyState === WebSocket.OPEN) {
+        if (mode === 'single' && backendWsRef.current?.readyState === WebSocket.OPEN) {
           backendWsRef.current.send(chunk);
         }
       });
+      recordersRef.current = [recorder];
 
-      // 대면 모드는 항상 마이크, 영상 더빙 모드는 선택된 입력 소스 사용
       const source: InputSource = mode === 'dual' ? 'mic' : inputSource;
       setStatusMessage(
         source === 'system'
           ? '공유할 탭/화면을 선택해 주세요 (탭 오디오 공유 체크 필수)...'
           : '마이크 권한 요청 중...'
       );
-      await recorderRef.current.start(source);
+      await recorder.start({ source });
 
       setStatusMessage('연결 설정 중...');
 
-      // 2. 모드에 따라 세션 구성
       if (mode === 'dual') {
-        // 대면 양방향: 서로 반대 타깃 2세션, echo=false → 이미 타깃 언어인 입력은 침묵 처리되어 중복 방지
-        // 세션A(target=langB): langA 화자의 말을 langB로 번역 → 상대(B)쪽 자막
         const sessionA = new TranslationSession(
-          { 
-            apiKey, 
-            targetLang: langB, 
-            echoTargetLanguage: false, 
-            autoReconnect: true, 
-            volume: effectiveVolume, 
-            emitInputTranscript: false, 
+          {
+            apiKey,
+            targetLang: langB,
+            echoTargetLanguage: false,
+            autoReconnect: true,
+            volume: effectiveVolume,
+            emitInputTranscript: false,
             voiceName: voiceNameA,
-            getCurrentSpeaker: () => currentSpeakerRef.current 
+            getCurrentSpeaker: () => currentSpeakerRef.current,
           },
           { onStatus: handleSessionStatus, onTranscript: (t) => upsertTranscript(t, 'B') }
         );
-        // 세션B(target=langA): langB 화자의 말을 langA로 번역 → 내(A)쪽 자막
         const sessionB = new TranslationSession(
-          { 
-            apiKey, 
-            targetLang: langA, 
-            echoTargetLanguage: false, 
-            autoReconnect: true, 
-            volume: effectiveVolume, 
-            emitInputTranscript: false, 
+          {
+            apiKey,
+            targetLang: langA,
+            echoTargetLanguage: false,
+            autoReconnect: true,
+            volume: effectiveVolume,
+            emitInputTranscript: false,
             voiceName: voiceNameB,
-            getCurrentSpeaker: () => currentSpeakerRef.current 
+            getCurrentSpeaker: () => currentSpeakerRef.current,
           },
           { onStatus: handleSessionStatus, onTranscript: (t) => upsertTranscript(t, 'A') }
         );
         sessionsRef.current = [sessionA, sessionB];
       } else {
         const session = new TranslationSession(
-          { 
-            apiKey, 
-            targetLang, 
-            echoTargetLanguage: echoTarget, 
-            autoReconnect: true, 
-            volume: effectiveVolume, 
-            emitInputTranscript: true, 
+          {
+            apiKey,
+            targetLang,
+            echoTargetLanguage: echoTarget,
+            autoReconnect: true,
+            volume: effectiveVolume,
+            emitInputTranscript: true,
             voiceName: voiceNameA,
-            getCurrentSpeaker: () => currentSpeakerRef.current 
+            getCurrentSpeaker: () => currentSpeakerRef.current,
           },
           { onStatus: handleSessionStatus, onTranscript: (t) => upsertTranscript(t) }
         );
         sessionsRef.current = [session];
       }
 
-      // 3. 세션 연결 시작
       for (const session of sessionsRef.current) {
         session.connect();
       }
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error(error);
-      setStatusMessage(`⚠️ 마이크 획득 또는 초기화 실패: ${error.message || error}`);
+      const errMsg = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`⚠️ 초기화 실패: ${errMsg}`);
       stopTranslationSession();
     }
   };
 
-  const stopTranslationSession = () => {
-    setIsTranslating(false);
-    setStatusMessage('통역 세션이 중지되었습니다.');
-
-    if (recorderRef.current) {
-      recorderRef.current.stop();
-      recorderRef.current = null;
-    }
-
-    if (backendWsRef.current) {
-      backendWsRef.current.close();
-      backendWsRef.current = null;
-    }
-
-    for (const session of sessionsRef.current) {
-      session.close();
-    }
-    sessionsRef.current = [];
-  };
-
   const renderBubble = (item: TranscriptItem) => {
     const isInput = item.type === 'input';
-    
-    // 화자 ID 기반 동적 색상 색출 (3인 이상 확장 대응)
+
     let speakerColor = 'var(--accent-purple)';
     let speakerBgColor = 'rgba(139, 92, 246, 0.08)';
-    
+
     if (item.speaker) {
       let hash = 0;
       for (let i = 0; i < item.speaker.length; i++) {
@@ -369,14 +602,9 @@ function App() {
       speakerColor = colors[index].border;
       speakerBgColor = colors[index].bg;
     }
-    
-    const borderLeftColor = isInput 
-      ? `3px solid ${speakerColor}` 
-      : '3px solid var(--accent-green)';
-      
-    const backgroundColor = isInput 
-      ? speakerBgColor 
-      : 'rgba(16, 185, 129, 0.08)';
+
+    const borderLeftColor = isInput ? `3px solid ${speakerColor}` : '3px solid var(--accent-green)';
+    const backgroundColor = isInput ? speakerBgColor : 'rgba(16, 185, 129, 0.08)';
 
     return (
       <div
@@ -390,23 +618,24 @@ function App() {
       >
         <div style={styles.bubbleHeader}>
           <span style={styles.bubbleRole}>
-            {isInput 
-              ? `🗣️ 내 음성 ${item.speaker ? `(${item.speaker})` : ''}` 
+            {isInput
+              ? `🗣️ 내 음성 ${item.speaker ? `(${item.speaker})` : ''}`
               : '🤖 번역 결과'}
           </span>
-          {item.langCode && (
-            <span style={styles.bubbleLang}>{item.langCode.toUpperCase()}</span>
-          )}
+          {item.langCode && <span style={styles.bubbleLang}>{item.langCode.toUpperCase()}</span>}
         </div>
         <p style={styles.bubbleText}>{item.text}</p>
         <span style={styles.bubbleTime}>
-          {item.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+          {item.timestamp.toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          })}
         </span>
       </div>
     );
   };
 
-  // 대면 양방향: 한 화자 쪽 자막 패널 (가장 최근 발화 위주로 크게 표시)
   const renderDualSide = (side: 'A' | 'B', langCode: string) => {
     const items = transcripts.filter((t) => t.side === side).slice(-6);
     return (
@@ -458,7 +687,10 @@ function App() {
               type="button"
               onClick={() => setMode('single')}
               disabled={isTranslating}
-              style={{ ...styles.modeButton, ...(mode === 'single' ? styles.modeButtonActive : {}) }}
+              style={{
+                ...styles.modeButton,
+                ...(mode === 'single' ? styles.modeButtonActive : {}),
+              }}
             >
               🎬 영상·마이크 (단방향)
             </button>
@@ -466,14 +698,45 @@ function App() {
               type="button"
               onClick={() => setMode('dual')}
               disabled={isTranslating}
-              style={{ ...styles.modeButton, ...(mode === 'dual' ? styles.modeButtonActive : {}) }}
+              style={{
+                ...styles.modeButton,
+                ...(mode === 'dual' ? styles.modeButtonActive : {}),
+              }}
             >
               💬 대면 양방향
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('call')}
+              disabled={isTranslating}
+              style={{
+                ...styles.modeButton,
+                ...(mode === 'call' ? styles.modeButtonActive : {}),
+              }}
+            >
+              📞 영상통화 통역
             </button>
           </div>
         </div>
 
-        {mode === 'single' ? (
+        {mode === 'call' ? (
+          <CallSettings
+            myLang={callMyLang}
+            onMyLangChange={setCallMyLang}
+            remoteLang={callRemoteLang}
+            onRemoteLangChange={setCallRemoteLang}
+            micDeviceId={callMicDeviceId}
+            onMicDeviceIdChange={setCallMicDeviceId}
+            inboundSinkId={callInboundSinkId}
+            onInboundSinkIdChange={setCallInboundSinkId}
+            outboundSinkId={callOutboundSinkId}
+            onOutboundSinkIdChange={setCallOutboundSinkId}
+            inboundAudio={callInboundAudio}
+            onInboundAudioChange={setCallInboundAudio}
+            supportedLanguages={SUPPORTED_LANGUAGES}
+            disabled={isTranslating}
+          />
+        ) : mode === 'single' ? (
           <>
             <div style={styles.fieldRow}>
               <label style={styles.label}>소리 입력 소스</label>
@@ -563,7 +826,9 @@ function App() {
                   disabled={isTranslating}
                 >
                   {SUPPORTED_LANGUAGES.map((lang) => (
-                    <option key={lang.code} value={lang.code}>{lang.name}</option>
+                    <option key={lang.code} value={lang.code}>
+                      {lang.name}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -576,7 +841,9 @@ function App() {
                   disabled={isTranslating}
                 >
                   {SUPPORTED_LANGUAGES.map((lang) => (
-                    <option key={lang.code} value={lang.code}>{lang.name}</option>
+                    <option key={lang.code} value={lang.code}>
+                      {lang.name}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -608,14 +875,16 @@ function App() {
               </div>
             </div>
             <span style={styles.hint}>
-              기기를 두 사람 사이에 놓으세요. 상대방 쪽(위) 자막은 180° 회전되어 마주 본 사람이 바로 읽을 수 있습니다.
+              기기를 두 사람 사이에 놓으세요. 상대방 쪽(위) 자막은 180° 회전되어 마주 본 사람이 바로
+              읽을 수 있습니다.
             </span>
           </>
         )}
 
         <div style={styles.fieldRow}>
           <label style={styles.label}>
-            🔉 번역 음성 볼륨 — {subtitleOnly ? '자막 전용 (음소거)' : `${Math.round(outputVolume * 100)}%`}
+            🔉 번역 음성 볼륨 —{' '}
+            {subtitleOnly ? '자막 전용 (음소거)' : `${Math.round(outputVolume * 100)}%`}
           </label>
           <input
             type="range"
@@ -646,10 +915,13 @@ function App() {
       {/* 상태 및 조작 컨트롤 */}
       <section style={styles.controlPanel}>
         <div style={styles.statusBox}>
-          <span style={{
-            ...styles.statusIndicator,
-            backgroundColor: isTranslating ? 'var(--accent-green)' : 'var(--text-muted)'
-          }} className={isTranslating ? 'pulse-active' : ''}></span>
+          <span
+            style={{
+              ...styles.statusIndicator,
+              backgroundColor: isTranslating ? 'var(--accent-green)' : 'var(--text-muted)',
+            }}
+            className={isTranslating ? 'pulse-active' : ''}
+          />
           <span style={styles.statusText}>{statusMessage}</span>
         </div>
 
@@ -657,7 +929,7 @@ function App() {
           onClick={isTranslating ? stopTranslationSession : startTranslationSession}
           style={{
             ...styles.actionButton,
-            backgroundColor: isTranslating ? 'var(--accent-red)' : 'var(--accent-purple)'
+            backgroundColor: isTranslating ? 'var(--accent-red)' : 'var(--accent-purple)',
           }}
         >
           {isTranslating ? '⏹️ 통역 중지하기' : '🎙️ 실시간 통역 시작'}
@@ -665,7 +937,18 @@ function App() {
       </section>
 
       {/* 실시간 통역 자막 피드 */}
-      {mode === 'dual' ? (
+      {mode === 'call' ? (
+        <section style={styles.callPanel}>
+          <CallTranscriptView
+            inboundTranscripts={inboundTranscripts}
+            outboundTranscripts={outboundTranscripts}
+            inboundStatus={inboundStatus}
+            outboundStatus={outboundStatus}
+            myLang={callMyLang}
+            remoteLang={callRemoteLang}
+          />
+        </section>
+      ) : mode === 'dual' ? (
         <section style={styles.dualPanel}>
           {/* 상대방 쪽 (위, 180도 회전) */}
           <div style={{ ...styles.dualHalf, transform: 'rotate(180deg)' }}>
@@ -673,9 +956,7 @@ function App() {
           </div>
           <div style={styles.dualDivider} />
           {/* 내 쪽 (아래, 정방향) */}
-          <div style={styles.dualHalf}>
-            {renderDualSide('A', langA)}
-          </div>
+          <div style={styles.dualHalf}>{renderDualSide('A', langA)}</div>
         </section>
       ) : (
         <section style={styles.feedPanel}>
@@ -700,7 +981,7 @@ function App() {
 // 프리미엄 다크 스타일 인라인 정의 (Vanilla CSS와 협업)
 const styles: Record<string, React.CSSProperties> = {
   container: {
-    maxWidth: '650px',
+    maxWidth: '780px',
     width: '100%',
     margin: '0 auto',
     padding: '24px 16px',
@@ -809,9 +1090,11 @@ const styles: Record<string, React.CSSProperties> = {
   modeToggle: {
     display: 'flex',
     gap: '8px',
+    flexWrap: 'wrap',
   },
   modeButton: {
     flex: 1,
+    minWidth: '120px',
     padding: '10px 12px',
     fontSize: '13px',
     fontWeight: '600',
@@ -925,6 +1208,11 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: 'pointer',
     transition: 'transform 0.1s, filter 0.2s',
     boxShadow: '0 4px 15px rgba(0,0,0,0.3)',
+  },
+  callPanel: {
+    flexGrow: 1,
+    display: 'flex',
+    flexDirection: 'column',
   },
   feedPanel: {
     flexGrow: 1,

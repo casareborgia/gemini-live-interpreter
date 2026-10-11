@@ -1,6 +1,12 @@
 /**
- * 실시간 마이크 오디오 녹음 및 16kHz 16-bit PCM 변환 유틸리티 (하드웨어 샘플레이트 자동 리샘플링 대응)
+ * 실시간 마이크/시스템 오디오 녹음 및 16kHz 16-bit PCM 변환 유틸리티 (하드웨어 샘플레이트 자동 리샘플링 대응)
  */
+
+export interface RecorderOptions {
+  source: 'mic' | 'system';
+  deviceId?: string; // source === 'mic' 일 때 getUserMedia 의 deviceId: { exact }
+}
+
 export class AudioRecorder {
   private audioContext: AudioContext | null = null;
   private stream: MediaStream | null = null;
@@ -14,32 +20,54 @@ export class AudioRecorder {
 
   /**
    * 오디오 녹음 시작
-   * @param source 'mic' = 내 마이크 / 'system' = 재생 중인 탭·화면의 소리(영상 더빙용)
+   * @param options 입력 소스 ('mic' | 'system') 및 장치 ID 설정
    */
-  async start(source: 'mic' | 'system' = 'mic'): Promise<void> {
+  async start(options: RecorderOptions): Promise<void> {
+    const { source, deviceId } = options;
+
     if (source === 'system') {
-      // 탭/화면 소리 캡처: 사용자가 공유할 탭을 고르고 '탭 오디오 공유'를 체크해야 함
+      // 탭/화면 소리 캡처: 사용자가 공유할 화면/창/탭을 고르고 '오디오 공유'를 체크해야 함
       try {
         this.stream = await navigator.mediaDevices.getDisplayMedia({
-          video: true, // 브라우저 규격상 video:true가 있어야 탭 선택 UI가 뜸 (영상 트랙은 사용하지 않음)
+          video: true, // 브라우저 규격상 video:true가 있어야 선택 UI가 뜸 (영상 트랙은 사용하지 않음)
           audio: {
             echoCancellation: false,
             noiseSuppression: false,
             autoGainControl: false,
           },
         });
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error('getDisplayMedia 실패:', err);
-        throw new Error(`화면/탭 소리 캡처를 시작하지 못했습니다: ${err.name || err.message}`);
+        const errMsg = err instanceof Error ? err.message : String(err);
+        throw new Error(`화면/시스템 소리 캡처를 시작하지 못했습니다: ${errMsg}`, { cause: err });
       }
 
       if (this.stream.getAudioTracks().length === 0) {
         this.stop();
-        throw new Error("선택한 화면에 소리가 없습니다. 탭을 공유하면서 '탭 오디오 공유(Share tab audio)'를 반드시 체크해 주세요.");
+        throw new Error(
+          "선택한 화면에 오디오가 포함되지 않았습니다. 텔레그램 창이나 전체 화면을 공유할 때 '시스템 오디오 공유(Share system/tab audio)'를 반드시 체크해 주세요."
+        );
       }
     } else {
-      try {
-        // 마이크 권한 요청 (블루투스 헤드셋 및 다중 입출력 기기 대응을 위해 단순한 true부터 순차 폴백 시도)
+      // 마이크 오디오 캡처
+      if (deviceId) {
+        // 특정 deviceId가 지정된 경우 정확한 장치를 획득. 실패 시 기본 장치로 폴백하지 않고 즉시 에러 발생
+        try {
+          this.stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              deviceId: { exact: deviceId },
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+            video: false,
+          });
+        } catch (err: unknown) {
+          console.error('지정된 마이크 획득 실패:', err);
+          const errMsg = err instanceof Error ? err.message : String(err);
+          throw new Error(`지정한 마이크 장치(${deviceId})를 열 수 없습니다: ${errMsg}`, { cause: err });
+        }
+      } else {
+        // 기본 마이크 획득 시도 (실패 시 최소 제약조건으로 순차 폴백)
         try {
           this.stream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -49,26 +77,33 @@ export class AudioRecorder {
             video: false,
           });
         } catch (firstErr) {
-          console.warn('상세 옵션으로 마이크 획득 실패, 기본값으로 재시도:', firstErr);
-          // 제약 조건을 최소화하여 장치 탐색 오류 방지
-          this.stream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-            video: false,
-          });
+          console.warn('상세 옵션으로 마이크 획득 실패, 기본 옵션으로 재시도:', firstErr);
+          try {
+            this.stream = await navigator.mediaDevices.getUserMedia({
+              audio: true,
+              video: false,
+            });
+          } catch (err: unknown) {
+            console.error('navigator.mediaDevices.getUserMedia 실패:', err);
+            const errMsg = err instanceof Error ? err.message : String(err);
+            throw new Error(`마이크 권한을 승인받지 못했거나 기기를 찾을 수 없습니다: ${errMsg}`, { cause: err });
+          }
         }
-      } catch (err: any) {
-        console.error('navigator.mediaDevices.getUserMedia 실패:', err);
-        throw new Error(`마이크 권한을 승인받지 못했거나 기기를 찾을 수 없습니다: ${err.name || err.message}`);
       }
     }
 
     try {
-      // 2. AudioContext 초기화 (기기 기본 샘플레이트 활용)
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      // AudioContext 초기화 (기기 기본 샘플레이트 활용)
+      const AudioContextClass =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextClass) {
+        throw new Error('이 브라우저는 AudioContext를 지원하지 않습니다.');
+      }
       this.audioContext = new AudioContextClass();
-      
+
       this.source = this.audioContext.createMediaStreamSource(this.stream);
-      
+
       // 버퍼 사이즈 4096 (적정한 주기 설정)
       this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
 
@@ -76,13 +111,13 @@ export class AudioRecorder {
 
       this.processor.onaudioprocess = (e) => {
         if (!this.audioContext) return;
-        
+
         const inputData = e.inputBuffer.getChannelData(0); // Float32Array
-        
+
         // 입력 기기 샘플레이트에서 16kHz로 소프트웨어 다운샘플링 리샘플링 실행
         const resampledData = this.resampleTo16k(inputData, inputSampleRate);
         const pcm16Buffer = this.convertToPCM16(resampledData);
-        
+
         this.onAudioChunk(pcm16Buffer);
       };
 
@@ -93,10 +128,11 @@ export class AudioRecorder {
       if (this.audioContext.state === 'suspended') {
         await this.audioContext.resume();
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('AudioContext 연결 생성 실패:', err);
       this.stop();
-      throw new Error(`오디오 파이프라인 생성 실패: ${err.message}`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      throw new Error(`오디오 파이프라인 생성 실패: ${errMsg}`, { cause: err });
     }
   }
 
@@ -105,8 +141,16 @@ export class AudioRecorder {
    */
   stop(): void {
     if (this.processor && this.source) {
-      this.processor.disconnect();
-      this.source.disconnect();
+      try {
+        this.processor.disconnect();
+      } catch {
+        /* noop */
+      }
+      try {
+        this.source.disconnect();
+      } catch {
+        /* noop */
+      }
     }
 
     if (this.stream) {
@@ -130,17 +174,17 @@ export class AudioRecorder {
     if (inputSampleRate === 16000) {
       return inputBuffer;
     }
-    
+
     const sampleRateRatio = inputSampleRate / 16000;
     const newLength = Math.round(inputBuffer.length / sampleRateRatio);
     const result = new Float32Array(newLength);
-    
+
     let offsetResult = 0;
     let offsetInput = 0;
-    
+
     while (offsetResult < result.length) {
       const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
-      
+
       // 선형 보간 (Linear Interpolation) 계산
       let accum = 0;
       let count = 0;
@@ -149,11 +193,11 @@ export class AudioRecorder {
         count++;
       }
       result[offsetResult] = count > 0 ? accum / count : 0;
-      
+
       offsetResult++;
       offsetInput = nextOffsetBuffer;
     }
-    
+
     return result;
   }
 
@@ -165,8 +209,8 @@ export class AudioRecorder {
     const view = new DataView(buffer);
 
     for (let i = 0; i < float32Array.length; i++) {
-      let s = Math.max(-1, Math.min(1, float32Array[i]));
-      const sample = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      const s = Math.max(-1, Math.min(1, float32Array[i]));
+      const sample = s < 0 ? s * 0x8000 : s * 0x7fff;
       view.setInt16(i * 2, sample, true); // true = Little-Endian
     }
 
