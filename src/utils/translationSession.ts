@@ -30,6 +30,8 @@ export interface TranslationSessionOptions {
   emitInputTranscript?: boolean;
   /** 번역 음성 출력 목소리 이름 (예: Puck, Kore 등) */
   voiceName?: string;
+  /** 현재 감지된 화자 정보를 가져오기 위한 콜백 */
+  getCurrentSpeaker?: () => string;
 }
 
 const MODEL_NAME = 'gemini-3.5-live-translate-preview';
@@ -48,6 +50,7 @@ export class TranslationSession {
   private outputId: string | null = null;
   private inputText = '';
   private outputText = '';
+  private isNewTurn = true; // 턴 시작 플래그
 
   constructor(opts: TranslationSessionOptions, cb: TranslationSessionCallbacks = {}) {
     this.opts = opts;
@@ -91,7 +94,24 @@ export class TranslationSession {
   private buildWsUrl(): string {
     const isSecure = window.location.protocol === 'https:';
     const wsProtocol = isSecure ? 'wss:' : 'ws:';
-    return `${wsProtocol}//${window.location.host}/ws-api/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${this.opts.apiKey}`;
+    
+    const isProduction = import.meta.env.PROD;
+    let backendHost = window.location.host;
+    
+    if (isProduction) {
+      const envBackendUrl = import.meta.env.VITE_BACKEND_URL;
+      if (envBackendUrl) {
+        try {
+          backendHost = envBackendUrl.replace(/^wss?:\/\//, '').replace(/^https?:\/\//, '');
+        } catch {
+          /* noop */
+        }
+      }
+    } else {
+      backendHost = 'localhost:8000';
+    }
+    
+    return `${wsProtocol}//${backendHost}/ws-api/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`;
   }
 
   private buildSetupMessage() {
@@ -137,6 +157,8 @@ export class TranslationSession {
     ws.onopen = () => {
       this.reconnectAttempts = 0;
       this.cb.onStatus?.('open');
+      // 첫 번째 프레임으로 백엔드 인증 정보 송신 (URL 쿼리 키 노출 방지)
+      ws.send(JSON.stringify({ auth: { apiKey: this.opts.apiKey } }));
       ws.send(JSON.stringify(this.buildSetupMessage()));
     };
 
@@ -206,6 +228,14 @@ export class TranslationSession {
 
     // 번역된 오디오 청크 재생
     if (content.modelTurn?.parts) {
+      if (this.isNewTurn) {
+        this.isNewTurn = false;
+        if (this.opts.getCurrentSpeaker) {
+          const speaker = this.opts.getCurrentSpeaker();
+          const pitch = getPitchForSpeaker(speaker);
+          this.player.setPitchSemitones(pitch);
+        }
+      }
       for (const part of content.modelTurn.parts) {
         if (part.inlineData) this.player.playChunk(part.inlineData.data);
       }
@@ -217,10 +247,30 @@ export class TranslationSession {
       this.outputId = null;
       this.inputText = '';
       this.outputText = '';
+      this.isNewTurn = true; // 새 턴 대기
     }
+  }
+
+  /**
+   * 화자가 바뀌거나 발화 흐름을 쪼개야 할 때 강제로 새 말풍선(새 턴)으로 분할
+   */
+  splitTurn(): void {
+    this.inputId = null;
+    this.outputId = null;
+    this.inputText = '';
+    this.outputText = '';
+    this.isNewTurn = true;
   }
 }
 
 function randomId(): string {
   return Math.random().toString(36).substr(2, 9);
+}
+
+function getPitchForSpeaker(speaker: string): number {
+  if (!speaker) return 0;
+  const match = speaker.match(/\d+/);
+  const num = match ? parseInt(match[0], 10) : 0;
+  const pitches = [0, 3, -3, 5, -4];
+  return pitches[num % pitches.length];
 }

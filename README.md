@@ -46,7 +46,7 @@ Gemini Live Interpreter는 Google Gemini 3.5 Live API(WebSocket)를 활용하여
 
 ## 🏗️ 아키텍처 및 핵심 파일 구조
 
-*   [`src/App.tsx`](file:///Users/leeseungjun/coding/AI%20%ED%95%99%EC%8A%B5%20%EC%8B%A4%EC%8A%B5/%EB%B2%88%EC%97%AD%EB%B4%87/src/App.tsx): 단방향 및 대면 양방향 스플릿 자막 뷰 UI를 관리하고 오디오 캡처를 제어합니다.
-*   [`src/utils/translationSession.ts`](file:///Users/leeseungjun/coding/AI%20%ED%95%99%EC%8A%B5%20%EC%8B%A4%EC%8A%B5/%EB%B2%88%EC%97%AD%EB%B4%87/src/utils/translationSession.ts): 개별 실시간 웹소켓 세션을 담당하는 캡슐화 모듈입니다.
-*   [`src/utils/audioRecorder.ts`](file:///Users/leeseungjun/coding/AI%20%ED%95%99%EC%8A%B5%20%EC%8B%A4%EC%8A%B5/%EB%B2%88%EC%97%AD%EB%B4%87/src/utils/audioRecorder.ts): 브라우저 MediaDevices API를 활용하여 마이크 또는 시스템 사운드를 16kHz PCM 포맷으로 녹음 및 전송합니다.
-*   [`src/utils/audioPlayer.ts`](file:///Users/leeseungjun/coding/AI%20%ED%95%99%EC%8A%B5%20%EC%8B%A4%EC%8A%B5/%EB%B2%88%EC%97%AD%EB%B4%87/src/utils/audioPlayer.ts): 실시간으로 수신한 오디오 바이너리 청크들을 디코딩하여 매끄럽게 스트리밍 재생합니다.
+*   [`src/App.tsx`](src/App.tsx): 단방향 및 대면 양방향 스플릿 자막 뷰 UI를 관리하고 오디오 캡처를 제어합니다.
+*   [`src/utils/translationSession.ts`](src/utils/translationSession.ts): 개별 실시간 웹소켓 세션을 담당하는 캡슐화 모듈입니다.
+*   [`src/utils/audioRecorder.ts`](src/utils/audioRecorder.ts): 브라우저 MediaDevices API를 활용하여 마이크 또는 시스템 사운드를 16kHz PCM 포맷으로 녹음 및 전송합니다.
+*   [`src/utils/audioPlayer.ts`](src/utils/audioPlayer.ts): 실시간으로 수신한 오디오 바이너리 청크들을 디코딩하여 매끄럽게 스트리밍 재생합니다.

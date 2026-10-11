@@ -5,6 +5,7 @@ export class AudioPlayer {
   private audioContext: AudioContext | null = null;
   private gainNode: GainNode | null = null;
   private volume: number = 1; // 번역 음성 출력 볼륨 (0 ~ 1)
+  private pitchSemitones: number = 0; // 번역 음성 출력 음높이 (반음 단위)
   private nextPlayTime: number = 0;
   private sampleRate: number = 24000; // Gemini Live API 출력 기본값 24kHz
   // 현재 스케줄되어 재생 대기/진행 중인 소스 노드들 (밀렸을 때 버리고 따라잡기 위해 추적)
@@ -37,6 +38,13 @@ export class AudioPlayer {
     if (this.gainNode) {
       this.gainNode.gain.value = this.volume;
     }
+  }
+
+  /**
+   * 번역 음성 출력 음높이(피치) 반음 단위 설정. 이후 재생되는 청크부터 적용.
+   */
+  setPitchSemitones(semitones: number): void {
+    this.pitchSemitones = semitones;
   }
 
   /**
@@ -82,6 +90,11 @@ export class AudioPlayer {
     // 4. 버퍼 소스 노드를 볼륨 노드를 거쳐 스케줄링에 맞춰 연결 및 실행
     const sourceNode = this.audioContext.createBufferSource();
     sourceNode.buffer = audioBuffer;
+    
+    // 피치 변조 (playbackRate 조정)
+    const rate = Math.pow(2, this.pitchSemitones / 12);
+    sourceNode.playbackRate.value = rate;
+
     sourceNode.connect(this.gainNode ?? this.audioContext.destination);
 
     sourceNode.onended = () => {
@@ -91,8 +104,8 @@ export class AudioPlayer {
 
     sourceNode.start(this.nextPlayTime);
 
-    // 다음 플레이 스케줄링 시점 누적 (버퍼 지속시간 = 샘플개수 / 샘플레이트)
-    this.nextPlayTime += audioBuffer.duration;
+    // 다음 플레이 스케줄링 시점 누적 (버퍼 지속시간 = 샘플개수 / 샘플레이트 / 재생속도)
+    this.nextPlayTime += audioBuffer.duration / rate;
   }
 
   /**
